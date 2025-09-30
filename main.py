@@ -2,6 +2,9 @@
 
 import sys
 from spotify_agent import IntelligentShuffler
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def main():
     if len(sys.argv) < 2:
