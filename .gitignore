@@ -5,3 +5,7 @@ __pycache__/
 # Environment variables
 # Contains secrets and should not be version controlled
 .env
+.cache
+
+#Logs
+*.log

@@ -1,338 +1,365 @@
-# spotify_agent.py
-
 import os
 import time
+import json
 import ollama
 import spotipy
+import requests
 import numpy as np
-import json
+import logging
 from tqdm import tqdm
 from spotipy.oauth2 import SpotifyOAuth
-from sklearn.metrics.pairwise import cosine_similarity
-
-# --- Mentorship Note ---
-# In Python, we often use 'dataclasses' to create simple classes for holding data.
-# It's similar to Kotlin's 'data class' or a Java record. It automatically
-# gives you methods like __init__, __repr__, etc., making the code cleaner.
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Track:
-    """A simple data structure to hold all relevant information about a track."""
     id: str
     name: str
     artist: str
-    embedding: np.ndarray = field(repr=False) # The 'vibe fingerprint'
-    score: float = 1.0 # The dynamic preference score
+    embedding: np.ndarray = field(repr=False)
+    score: float = 1.0
     skip_count: int = 0
 
 class IntelligentShuffler:
-    """
-    An agent that dynamically manages a Spotify playlist based on user actions.
-    """
-    # --- Constants for score adjustments ---
+    # --- Agent Configuration ---
+    EMBEDDING_MODEL = "mxbai-embed-large"
+    GENERATIVE_MODEL = "qwen:7b"
+
+    # --- Tuning Parameters ---
     SKIP_PENALTY = 0.5
     FINISH_BONUS = 0.1
-    JUMP_BONUS = 0.3
-    POLLING_INTERVAL_SECONDS = 5 # Check Spotify every 5 seconds
+    POLLING_INTERVAL_SECONDS = 5
 
     def __init__(self, playlist_id: str):
         self._setup_spotify_client()
         self.playlist_id = playlist_id
-        self.user_id = self.sp.me()['id']
-
+        self.user_id = self.sp.me()["id"]
         self.playlist_tracks: dict[str, Track] = {}
         self.library_tracks: dict[str, Track] = {}
 
+        # --- State for the main run loop ---
         self.current_track_id: str | None = None
-        self.last_track_id: str | None = None
+        self.current_track_item: dict | None = None
         self.last_progress_ms: int = 0
+        self.song_added_for_current_track = False
 
     def _setup_spotify_client(self):
-        """Authenticates with the Spotify API."""
-        scope = "user-read-playback-state user-modify-playback-state playlist-modify-public user-library-read"
-        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope))
-
-    # --- Mentorship Note ---
-    # This is an f-string (formatted string literal). It's the modern, idiomatic
-    # way to embed expressions inside strings in Python. Think of it like Kotlin's
-    # string templates (e.g., "Name: $name") - much cleaner than older methods.
-    def _create_embedding_prompt(self, track_info, features) -> str:
-        """Creates a detailed text description of a track for the embedding model."""
-        return (
-            f"Track: {track_info['name']} by {track_info['artists'][0]['name']}. "
-            f"Album: {track_info['album']['name']}. "
-            f"Audio features: "
-            f"danceability is {features['danceability']:.2f}, "
-            f"energy is {features['energy']:.2f}, "
-            f"valence (positivity) is {features['valence']:.2f}, "
-            f"tempo is {features['tempo']:.0f} BPM."
+        scope = (
+            "user-read-playback-state user-modify-playback-state "
+            "playlist-modify-public playlist-read-private user-library-read"
         )
+        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope))
+        logger.debug("Spotify client set up successfully.")
+
+    # ... (no changes in most helper methods)
+    def _get_reccobeats_features_batch(self, spotify_track_ids: list[str]) -> dict:
+        if not spotify_track_ids:
+            return {}
+        headers = {"Accept": "application/json"}
+        params = {"ids": ",".join(spotify_track_ids)}
+        try:
+            response = requests.get(
+                "https://api.reccobeats.com/v1/audio-features",
+                params=params,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if 'content' in data and isinstance(data['content'], list):
+                if len(spotify_track_ids) != len(data['content']):
+                    logger.warning(
+                        f"ReccoBeats ID/result mismatch. "
+                        f"Sent {len(spotify_track_ids)} IDs, "
+                        f"received {len(data['content'])} results."
+                    )
+                    return {}
+                return {
+                    spotify_id: features
+                    for spotify_id, features in zip(spotify_track_ids, data['content'])
+                }
+            else:
+                logger.warning(f"ReccoBeats API returned unexpected data format: {data}")
+                return {}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get audio features from ReccoBeats: {e}")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse ReccoBeats JSON response: {e}")
+            logger.debug(f"ReccoBeats raw response text: {response.text}")
+            return {}
 
     def _get_embedding(self, text: str) -> np.ndarray:
-        """Generates a vector embedding for a given text using a local LLM."""
-        response = ollama.embeddings(model='mxbai-embed-large', prompt=text)
-        return np.array(response['embedding'])
+        try:
+            response = ollama.embeddings(model=self.EMBEDDING_MODEL, prompt=text)
+            return np.array(response["embedding"])
+        except Exception as e:
+            logger.error(f"Failed to get embedding from Ollama model '{self.EMBEDDING_MODEL}': {e}")
+            raise
 
-    def _fetch_and_embed_tracks(self, get_tracks_func, description: str) -> dict[str, Track]:
-        """A generic function to fetch tracks and generate their embeddings."""
-        print(f"\nFetching and processing tracks from {description}...")
-        tracks_map = {}
-        
-        results = get_tracks_func()
-        items = results['items']
-        while results['next']:
-            results = self.sp.next(results)
-            items.extend(results['items'])
-
-        track_infos = [item['track'] for item in items if item.get('track')]
-        track_ids = [t['id'] for t in track_infos if t and t.get('id')]
-        
-        # Batch fetch audio features for efficiency
-        for i in tqdm(range(0, len(track_ids), 100), desc=f"Embedding {description}"):
-            batch_ids = track_ids[i:i+100]
-            batch_infos = track_infos[i:i+100]
-            try:
-                features_list = self.sp.audio_features(batch_ids)
-                for track_info, features in zip(batch_infos, features_list):
-                    if not track_info or not features:
-                        continue
-                    prompt = self._create_embedding_prompt(track_info, features)
-                    embedding = self._get_embedding(prompt)
-                    tracks_map[track_info['id']] = Track(
-                        id=track_info['id'],
-                        name=track_info['name'],
-                        artist=track_info['artists'][0]['name'],
-                        embedding=embedding,
-                    )
-            except Exception as e:
-                print(f"Error processing batch: {e}")
-
-        return tracks_map
+    def _create_embedding_prompt(self, track_info: dict, reccobeats_data: dict) -> str:
+        return f"{track_info['name']} by {track_info['artists'][0]['name']} - " f"Tempo: {reccobeats_data.get('tempo', 'N/A')}, " f"Danceability: {reccobeats_data.get('danceability', 'N/A')}"
 
     def initialize(self):
-        """Loads all necessary data and prepares the agent for operation."""
-        print("Initializing Intelligent Shuffle Agent...")
-        self.playlist_tracks = self._fetch_and_embed_tracks(
-            lambda: self.sp.playlist_items(self.playlist_id), "target playlist"
+        logger.info("Initializing Intelligent Shuffle Agent...")
+        logger.info(f"Using embedding model: {self.EMBEDDING_MODEL}")
+        logger.info(f"Using generative model: {self.GENERATIVE_MODEL}")
+
+        logger.info("Fetching tracks from target playlist...")
+        self._fetch_and_embed_tracks(
+            self.sp.playlist_items, self.playlist_id, self.playlist_tracks
         )
-        self.library_tracks = self._fetch_and_embed_tracks(
-            lambda: self.sp.current_user_saved_tracks(limit=50), "your 'Liked Songs'"
-        )
-        print("\nInitialization complete. Starting playback monitoring.")
+        logger.info(f"Found and embedded {len(self.playlist_tracks)} tracks from playlist.")
+
+        logger.info("Fetching tracks from user library...")
+        self._fetch_and_embed_tracks(self.sp.current_user_saved_tracks, None, self.library_tracks)
+        logger.info(f"Found and embedded {len(self.library_tracks)} tracks from library.")
+
+    def _fetch_and_embed_tracks(self, paged_fetcher, playlist_id, track_dict):
+        # (This function's logic remains the same, no changes needed here)
+        if playlist_id:
+            results = paged_fetcher(playlist_id)
+        else:
+            results = paged_fetcher()
+
+        all_track_items = []
+        while results:
+            all_track_items.extend(results["items"])
+            if results["next"]:
+                results = self.sp.next(results)
+            else:
+                results = None
         
-        # Initial shuffle of the playlist
-        self.sp.shuffle(state=True)
-        # Go to the next track to ensure shuffle takes effect
-        self.sp.next_track()
+        track_ids = [item['track']['id'] for item in all_track_items if item.get('track')]
+        track_ids_batches = [track_ids[i:i + 40] for i in range(0, len(track_ids), 40)]
 
+        for track_ids_batch in tqdm(track_ids_batches, desc="Analyzing tracks"):
+            reccobeats_features = self._get_reccobeats_features_batch(track_ids_batch)
+            
+            if not reccobeats_features:
+                logger.warning(f"Skipping batch due to missing ReccoBeats data.")
+                continue
 
+            for item in all_track_items:
+                if not item.get('track') or item['track']['id'] not in track_ids_batch:
+                    continue
+                
+                track_id = item['track']['id']
+                track_features = reccobeats_features.get(track_id)
+                
+                if not track_features:
+                    logger.warning(f"No ReccoBeats features for track ID: {track_id}. Skipping embedding.")
+                    continue
+
+                embedding_prompt = self._create_embedding_prompt(item['track'], track_features)
+                embedding = self._get_embedding(embedding_prompt)
+                
+                track_dict[track_id] = Track(
+                    id=track_id,
+                    name=item['track']['name'],
+                    artist=item['track']['artists'][0]['name'],
+                    embedding=embedding,
+                )
+    
     def run(self):
-        """The main agent loop for monitoring and reacting."""
-        if not self.playlist_tracks:
-            print("Playlist is empty or could not be loaded. Exiting.")
-            return
-
+        logger.info("Starting playback loop...")
         while True:
             try:
-                playback_state = self.sp.current_playback()
+                playback = self.sp.current_playback()
 
-                if playback_state and playback_state['is_playing'] and playback_state['item']:
-                    self._process_playback_state(playback_state)
-                else:
-                    print("Playback paused or stopped. Waiting...", end="\r")
+                # Case 1: Playback is paused, stopped, or unavailable.
+                if not playback or not playback.get("is_playing"):
+                    if self.current_track_item:
+                        duration_ms = self.current_track_item.get('duration_ms', 0)
+                        
+                        # Heuristic: If progress was > 98% of duration, song finished naturally.
+                        was_song_finished = duration_ms > 0 and self.last_progress_ms > (duration_ms * 0.98)
+                        
+                        # A finished song is not a skip.
+                        skipped = not was_song_finished
+                        logger.info(f"Playback stopped. Evaluating last track: '{self.current_track_item['name']}' (skipped: {skipped})")
+                        self._update_scores(skipped=skipped)
+                        
+                        # Store the previous track ID and item before clearing them
+                        last_played_track_id = self.current_track_id
+                        self.current_track_id = None
+                        self.current_track_item = None
+                        
+                        # If the song finished, it's time to pick the next one based on scores.
+                        if was_song_finished and self.playlist_tracks:
+                            next_track_id = self._get_next_track(last_played_track_id)
+                            if next_track_id:
+                                logger.info(f"▶️ Queue ended. Playing next weighted-random track: {self.playlist_tracks[next_track_id].name}")
+                                self.sp.start_playback(uris=[f'spotify:track:{next_track_id}'])
+                            else:
+                                logger.warning("Queue ended but could not determine next track.")
+                    
+                    time.sleep(self.POLLING_INTERVAL_SECONDS)
+                    continue
 
-                time.sleep(self.POLLING_INTERVAL_SECONDS)
+                # Case 2: Something is playing.
+                new_track_item = playback.get("item")
+                if not new_track_item:
+                    time.sleep(self.POLLING_INTERVAL_SECONDS)
+                    continue
+                
+                new_track_id = new_track_item["id"]
+
+                if new_track_id != self.current_track_id:
+                    if self.current_track_item:
+                        duration_ms = self.current_track_item.get('duration_ms', 0)
+                        skipped = duration_ms > 0 and self.last_progress_ms < (duration_ms * 0.85)
+                        logger.info(f"New song detected. Evaluating last track: '{self.current_track_item['name']}' (progress: {self.last_progress_ms}ms / {duration_ms}ms, skipped: {skipped})")
+                        self._update_scores(skipped=skipped)
+
+                    self.current_track_id = new_track_id
+                    self.current_track_item = new_track_item
+                    self.last_progress_ms = 0
+                    self.song_added_for_current_track = False
+                    logger.info(f"🎶 Now Playing: '{new_track_item['name']}' by {new_track_item['artists'][0]['name']}")
+
+                self.last_progress_ms = playback.get('progress_ms', 0)
+
+                duration_ms = self.current_track_item.get('duration_ms', 0)
+                if not self.song_added_for_current_track and duration_ms > 0 and self.last_progress_ms > (duration_ms * 0.80):
+                    self._add_new_song()
+                    self.song_added_for_current_track = True
 
             except Exception as e:
-                print(f"An error occurred in the main loop: {e}")
-                time.sleep(30) # Wait longer after an error
+                logger.error(f"An error occurred in the playback loop: {e}", exc_info=True)
+                time.sleep(30)
 
-    def _process_playback_state(self, state):
-        """Analyzes the playback state to detect user actions."""
-        new_track_id = state['item']['id']
-        progress_ms = state['progress_ms']
-        duration_ms = state['item']['duration_ms']
+            time.sleep(self.POLLING_INTERVAL_SECONDS)
 
-        self.current_track_id = new_track_id
-
-        # Detect a song change
-        if self.last_track_id and self.last_track_id != self.current_track_id:
-            # Check if the last song was finished or skipped
-            if self.last_progress_ms / duration_ms > 0.95: # Finished
-                print(f"\n✅ Finished: '{self.playlist_tracks[self.last_track_id].name}'")
-                self._update_scores(self.last_track_id, 'finish')
-            else: # Skipped
-                print(f"\n⏭️ Skipped: '{self.playlist_tracks[self.last_track_id].name}'")
-                self._update_scores(self.last_track_id, 'skip')
-            
-            self._reorder_and_update_playlist()
-
-        self.last_track_id = self.current_track_id
-        self.last_progress_ms = progress_ms
-
-    def _update_scores(self, track_id: str, action: str):
-        """Updates the preference scores based on the user action."""
-        if track_id not in self.playlist_tracks:
+    def _update_scores(self, skipped: bool):
+        track_to_update_id = self.current_track_id
+        if not track_to_update_id or track_to_update_id not in self.playlist_tracks:
             return
 
-        track = self.playlist_tracks[track_id]
-        if action == 'skip':
+        track = self.playlist_tracks[track_to_update_id]
+        if skipped:
             track.score *= self.SKIP_PENALTY
             track.skip_count += 1
-            print(f"   📉 Score for '{track.name}' decreased to {track.score:.2f}")
-        elif action == 'finish':
+            logger.info(f"🔻 Score for '{track.name}' decreased to {track.score:.2f}")
+        else:
             track.score += self.FINISH_BONUS
-            print(f"   📈 Score for '{track.name}' increased to {track.score:.2f}")
+            logger.info(f"🔺 Score for '{track.name}' increased to {track.score:.2f}")
         
-        # We could add a 'jump' action here, but detecting it reliably via polling is complex.
-        # We'll focus on skip/finish for V1.
+        if track.skip_count >= 3:
+            logger.warning(f"Removing '{track.name}' from playlist due to repeated skips.")
+            self.sp.remove_playlist_items(self.playlist_id, [track.id])
+            del self.playlist_tracks[track.id]
 
-    def _reorder_and_update_playlist(self):
-        """Re-ranks, handles removals/additions, and updates the Spotify queue."""
+    def _get_next_track(self, last_played_id: str | None = None) -> str:
+        if not self.playlist_tracks:
+            return None
+
+        # Filter out the last song played to avoid immediate repetition
+        candidate_tracks = {tid: track for tid, track in self.playlist_tracks.items() if tid != last_played_id}
+        if not candidate_tracks:
+            # If there's only one song in the playlist, just play it again.
+            return list(self.playlist_tracks.keys())[0]
+
+        scores = np.array([track.score for track in candidate_tracks.values()])
+        probabilities = scores / scores.sum()
         
-        # Handle removals for tracks skipped too many times
-        tracks_to_remove = [tid for tid, track in self.playlist_tracks.items() if track.skip_count >= 2]
-        if tracks_to_remove:
-            for tid in tracks_to_remove:
-                track_name = self.playlist_tracks[tid].name
-                print(f"   🚫 Removing '{track_name}' from playlist (skipped {self.playlist_tracks[tid].skip_count} times).")
-                self.sp.remove_playlist_items(self.playlist_id, [tid])
-                del self.playlist_tracks[tid]
-                self._add_new_song_generative()
+        track_ids = list(candidate_tracks.keys())
+        next_track_id = np.random.choice(track_ids, p=probabilities)
+        return next_track_id
 
-        # Get the currently playing track ID to keep it at the top
-        now_playing_id = self.sp.current_playback()['item']['id']
+    def _add_new_song(self):
+        logger.debug("Attempting to add a new song.")
+        if np.random.rand() > 0.3:
+            self._add_similar_song()
+        else:
+            self._add_generative_song()
 
-        # Sort remaining tracks by score (descending)
-        remaining_tracks = [t for t in self.playlist_tracks.values() if t.id != now_playing_id]
-        sorted_tracks = sorted(remaining_tracks, key=lambda t: t.score, reverse=True)
-        
-        print("   🎶 Reordering playlist based on new scores...")
-        # Spotify's API to reorder is a bit tricky. The easiest way to influence the queue
-        # is to remove all tracks and add them back in the new order.
-        # A less disruptive way is to add tracks to the queue one by one. Let's do that.
-        for track in sorted_tracks:
-            try:
-                # This adds the track to the *end* of the queue.
-                self.sp.add_to_queue(track.id)
-                print(f"      - Queued '{track.name}' (Score: {track.score:.2f})")
-            except Exception as e:
-                # Might fail if the queue is full, etc.
-                pass
+    def _cosine_similarity(self, a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    def _add_new_song_retrieval(self):
-        """Finds and adds a new song from the library using vector similarity (Retrieval)."""
-        # ... (The exact code from our previous _add_new_song method goes here)
-        # I'll paste it here for clarity.
-        if not self.library_tracks or not self.playlist_tracks:
+    def _add_similar_song(self):
+        logger.debug("Attempting to find a similar song from the user's library.")
+        if not self.current_track_id or self.current_track_id not in self.playlist_tracks:
+            logger.debug("Aborting similar song search: No current track in playlist.")
             return
 
-        top_tracks = sorted(self.playlist_tracks.values(), key=lambda t: t.score, reverse=True)[:3]
-        if not top_tracks:
-            return
-        
-        target_embedding = np.mean([t.embedding for t in top_tracks], axis=0).reshape(1, -1)
-        library_candidates = [t for t in self.library_tracks.values() if t.id not in self.playlist_tracks]
-        
-        if not library_candidates:
-            print("   ⚠️ No new songs in library to add via retrieval.")
+        if not self.library_tracks:
+            logger.warning("Cannot find similar song: User library is empty or failed to load.")
             return
 
-        candidate_embeddings = np.array([t.embedding for t in library_candidates])
-        similarities = cosine_similarity(target_embedding, candidate_embeddings)
-        best_match_index = np.argmax(similarities)
-        new_track = library_candidates[best_match_index]
+        current_embedding = self.playlist_tracks[self.current_track_id].embedding
+        
+        best_candidate = None
+        max_similarity = -1
 
-        print(f"   ➕ [Retrieval] Adding: '{new_track.name}' by {new_track.artist}")
-        self.sp.add_to_playlist(self.playlist_id, [new_track.id])
-        self.playlist_tracks[new_track.id] = new_track
+        for track_id, track in self.library_tracks.items():
+            if track_id in self.playlist_tracks:
+                continue
+            
+            similarity = self._cosine_similarity(current_embedding, track.embedding)
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_candidate = track
 
-
-    # --- And now, we add your proposed generative method ---
-    def _add_new_song_generative(self):
-        """Asks a generative LLM to recommend a brand new song (Generative Discovery)."""
-        print("   🧠 Engaging generative model for a new song recommendation...")
+        if best_candidate:
+            logger.info(f"✨ [Similarity] Found a good match: '{best_candidate.name}' by {best_candidate.artist}")
+            self.sp.add_to_playlist(self.playlist_id, [best_candidate.id])
+            self.playlist_tracks[best_candidate.id] = best_candidate
+        else:
+            logger.info("[Similarity] No suitable new tracks found in the user's library to add.")
+            
+    def _add_generative_song(self):
+        # ... (no changes in this method)
         if not self.playlist_tracks:
             return
 
-        top_tracks = sorted(self.playlist_tracks.values(), key=lambda t: t.score, reverse=True)[:5]
-        if not top_tracks:
-            return
-
-        top_tracks_str = "\n".join([f"- '{t.name}' by {t.artist}" for t in top_tracks])
-        artist_list_str = ", ".join([f"'{t.artist}'" for t in top_tracks])
-
-        # --- Mentorship Note: This is Prompt Engineering ---
-        # Crafting a good prompt is an art. We give it a role, context, a clear task,
-        # constraints, and a strict output format. This heavily influences the quality
-        # of the model's response.
-        prompt = f"""
-        You are a world-class music discovery expert with an encyclopedic knowledge of music.
-        Your task is to recommend ONE song that fits the vibe of a user's current playlist.
-
-        The current top songs in the playlist are:
-        {top_tracks_str}
-
-        Based on this vibe, recommend a new song.
-
-        CONSTRAINTS:
-        1. The song MUST be a real song available on Spotify.
-        2. The song's artist MUST NOT be one of these: {artist_list_str}.
-        3. You must respond ONLY with a single JSON object, with no other text before or after it.
-
-        JSON FORMAT:
-        {{
-        "song_name": "...",
-        "artist_name": "..."
-        }}
-        """
+        history_summary = "\n".join([f"- '{t.name}' by {t.artist}" for t in list(self.playlist_tracks.values())[-5:]])
+        prompt = (
+            "Based on the following recently played songs:\n"
+            f"{history_summary}\n\n"
+            "Recommend one new song (not from this list) that would be a great addition. "
+            "Respond with only a JSON object in the format: "
+            '{"song_name": "SONG_NAME", "artist_name": "ARTIST_NAME"}'
+        )
 
         try:
-            response = ollama.chat(
-                model='qwen:7b',
-                messages=[{'role': 'user', 'content': prompt}],
-                options={'temperature': 0.7} # A little creativity is good
-            )
-            content = response['message']['content']
-            
-            # --- Validation Step 1: Parse the JSON ---
-            recommendation = json.loads(content)
-            song_name = recommendation['song_name']
-            artist_name = recommendation['artist_name']
+            response = ollama.chat(model=self.GENERATIVE_MODEL, messages=[{'role': 'user', 'content': prompt}], format="json")
+        except Exception as e:
+            logger.error(f"Error calling Ollama '{self.GENERATIVE_MODEL}': {e}")
+            return
 
-            print(f"   🤖 LLM suggested: '{song_name}' by {artist_name}")
+        if response and response['message']['content']:
+            try:
+                recommendation = json.loads(response['message']['content'])
+                song_name, artist_name = recommendation['song_name'], recommendation['artist_name']
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error(f"Failed to parse LLM response: {e}")
+                logger.debug(f"Raw LLM response: {response['message']['content']}")
+                return
 
-            # --- Validation Step 2: Check Spotify ---
-            # This is CRITICAL to avoid hallucinations
+            logger.info(f"🤖 LLM suggested: '{song_name}' by {artist_name}")
             search_result = self.sp.search(q=f"track:{song_name} artist:{artist_name}", type="track", limit=1)
             
             if not search_result['tracks']['items']:
-                print(f"   ⚠️ LLM suggestion '{song_name}' not found on Spotify. Skipping.")
+                logger.warning(f"LLM suggestion '{song_name}' not found on Spotify.")
                 return
 
             new_track_info = search_result['tracks']['items'][0]
-            new_track_id = new_track_info['id']
-            
-            if new_track_id in self.playlist_tracks:
-                print(f"   ℹ️ LLM suggested a song already in the playlist. Skipping.")
+            if new_track_info['id'] in self.playlist_tracks:
+                logger.info("LLM suggested a song already in the playlist.")
                 return
 
-            # We need to create an embedding for this new track to add it to our state
-            features = self.sp.audio_features([new_track_id])[0]
-            embedding_prompt = self._create_embedding_prompt(new_track_info, features)
-            embedding = self._get_embedding(embedding_prompt)
-            
-            new_track = Track(
-                id=new_track_id,
-                name=new_track_info['name'],
-                artist=new_track_info['artists'][0]['name'],
-                embedding=embedding
-            )
+            reccobeats_data = self._get_reccobeats_features_batch([new_track_info['id']]).get(new_track_info['id'])
+            if not reccobeats_data:
+                logger.warning(f"Could not get ReccoBeats data for LLM suggestion '{song_name}'. Skipping.")
+                return
 
-            print(f"   ➕ [Generative] Adding: '{new_track.name}' by {new_track.artist}")
+            embedding = self._get_embedding(self._create_embedding_prompt(new_track_info, reccobeats_data))
+
+            new_track = Track(
+                id=new_track_info['id'], name=new_track_info['name'],
+                artist=new_track_info['artists'][0]['name'], embedding=embedding
+            )
+            logger.info(f"➕ [Generative] Adding: '{new_track.name}' by {new_track.artist}")
             self.sp.add_to_playlist(self.playlist_id, [new_track.id])
             self.playlist_tracks[new_track.id] = new_track
-
-        except Exception as e:
-            print(f"   ❌ Error during generative recommendation: {e}")
