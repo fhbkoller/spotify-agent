@@ -57,12 +57,21 @@ class PersistenceManager:
                 found_tracks[row_dict['id']] = row_dict
 
         found_ids = list(found_tracks.keys())
+        # Fetch embeddings in chunks to avoid backend limits
         if found_ids:
-            embeddings_result = self.embedding_collection.get(ids=found_ids, include=["embeddings"])
-            
-            for sid, embedding in zip(embeddings_result['ids'], embeddings_result['embeddings']):
-                if sid in found_tracks:
-                    found_tracks[sid]['embedding'] = np.array(embedding)
+            chunk_size = 100
+            for i in range(0, len(found_ids), chunk_size):
+                batch_ids = found_ids[i:i+chunk_size]
+                embeddings_result = self.embedding_collection.get(ids=batch_ids, include=["embeddings"])
+                ids_with_embeddings = embeddings_result.get('ids')
+                if ids_with_embeddings is None:
+                    ids_with_embeddings = []
+                embeddings = embeddings_result.get('embeddings')
+                if embeddings is None:
+                    embeddings = []
+                for sid, embedding in zip(ids_with_embeddings, embeddings):
+                    if sid in found_tracks and embedding is not None:
+                        found_tracks[sid]['embedding'] = np.array(embedding)
 
         missing_ids = [sid for sid in spotify_ids if sid not in found_tracks]
         
@@ -70,10 +79,7 @@ class PersistenceManager:
         return found_tracks, missing_ids
 
     def save_track(self, track_data: dict):
-        if 'embedding' not in track_data:
-            logger.error(f"Cannot save track {track_data.get('id')}: Missing embedding.")
-            return
-
+        """Save or upsert the song row. Embedding is optional and saved separately if provided."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
         stmt = sqlite_insert(songs_table).values(
             id=track_data["id"],
@@ -87,11 +93,25 @@ class PersistenceManager:
             conn.execute(stmt)
             conn.commit()
 
-        self.embedding_collection.add(
-            ids=[track_data["id"]],
-            embeddings=[track_data["embedding"].tolist()],
-        )
-        logger.debug(f"Saved new track '{track_data['name']}' to local databases.")
+        if 'embedding' in track_data and track_data['embedding'] is not None:
+            self.save_embedding(track_data["id"], track_data["embedding"])
+        logger.debug(f"Saved track row '{track_data['name']}' to SQLite and optional embedding to Chroma.")
+
+    def save_embedding(self, track_id: str, embedding: np.ndarray):
+        try:
+            self.embedding_collection.add(
+                ids=[track_id],
+                embeddings=[embedding.tolist()],
+            )
+        except Exception:
+            try:
+                # Fallback to update if already exists
+                self.embedding_collection.update(
+                    ids=[track_id],
+                    embeddings=[embedding.tolist()],
+                )
+            except Exception as e:
+                logger.error(f"Failed to write embedding for {track_id}: {e}")
 
     def update_track_stats(self, track_id: str, new_score: float, new_skip_count: int):
         stmt = (
