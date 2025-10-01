@@ -1,0 +1,8 @@
+spotipy
+python-dotenv
+tqdm
+sqlalchemy
+chromadb
+numpy
+requests
+ollama
