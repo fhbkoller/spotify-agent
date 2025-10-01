@@ -150,7 +150,7 @@ class IntelligentShuffler:
                         if tid not in cache:
                             cache[tid] = Track(id=tid, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=np.zeros(384))
         return cache
-    
+
     def reset_queue_weights(self):
         """Reset the weights (scores) of all songs in the current queue to the initial value and update the DB."""
         for track_id in self.playback_queue:
@@ -443,44 +443,93 @@ class IntelligentShuffler:
         # Add low-weight artist context
         parts.append(f"artist:{artist}")
         return " ".join(parts)
-    
-    # Removed deprecated Spotify audio-features fallback
+
+    def _build_generative_prompt(self, seed_tracks: list[Track]) -> str:
+        """Builds a detailed, context-rich prompt for the generative model."""
+        if not seed_tracks:
+            return ""
+
+        # Fetch audio features for the seed tracks to enrich the prompt
+        seed_ids = [t.id for t in seed_tracks]
+        features_map = self._get_reccobeats_features_batch(seed_ids)
+        
+        # Build the detailed analysis section of the prompt
+        track_analysis_str = ""
+        artists_to_exclude = set()
+        for track in seed_tracks:
+            artists_to_exclude.add(track.artist)
+            features = features_map.get(track.id)
+            track_analysis_str += f"* **Track:** \"{track.name}\" by {track.artist}\n"
+            if features:
+                track_analysis_str += (
+                    f"    * **Key Features:** "
+                    f"danceability={features.get('danceability', 'N/A')}, "
+                    f"energy={features.get('energy', 'N/A')}, "
+                    f"valence={features.get('valence', 'N/A')}\n"
+                )
+
+        prompt = f"""You are an expert music curator with deep knowledge of genres, moods, and sonic textures.
+Your task is to recommend ONE new song that is sonically and thematically similar to the following tracks.
+Do not recommend another song by any of the following artists: {', '.join(artists_to_exclude)}.
+
+**Analysis of Provided Tracks:**
+{track_analysis_str}
+**Your Recommendation:**
+Based on this analysis, recommend one new song that shares a similar vibe and audio features.
+
+Respond ONLY with a single, valid JSON object in the format:
+{{"song_name": "SONG_TITLE", "artist_name": "ARTIST_NAME"}}
+"""
+        return prompt
 
     def _add_generative_song(self):
         if not self.playlist_tracks: return
-        history = "\n".join([f"- '{t.name}'" for t in list(self.playlist_tracks.values())[-5:]])
-        prompt = (f"Songs played:\n{history}\n\nRecommend a new song. Respond with JSON: "
-                  '{"song_name": "SONG", "artist_name": "ARTIST"}')
+        
+        # Use the last 5 played tracks as the seed for the recommendation
+        seed_tracks = list(self.playlist_tracks.values())[-5:]
+        prompt = self._build_generative_prompt(seed_tracks)
+
+        if not prompt:
+            logger.warning("[Generative] Could not build prompt, skipping.")
+            return
+
         try:
             response = ollama.chat(model=self.GENERATIVE_MODEL, messages=[{'role': 'user', 'content': prompt}], format="json")
             content = response['message']['content']
-            # Robust parsing: tolerate minor key name issues
-            try:
-                recommendation = json.loads(content)
-            except json.JSONDecodeError:
-                # Try to fix common issues (e.g., stray commas, wrong quotes)
-                content_fixed = content.replace('\n', ' ').replace('"song_ name"', '"song_name"')
-                recommendation = json.loads(content_fixed)
-            song_name = recommendation.get('song_name') or recommendation.get('songName') or recommendation.get('song')
-            artist_name = recommendation.get('artist_name') or recommendation.get('artistName') or recommendation.get('artist')
+            
+            # Robust parsing
+            recommendation = json.loads(content)
+            song_name = recommendation.get('song_name')
+            artist_name = recommendation.get('artist_name')
+
             if not song_name or not artist_name:
-                logger.warning(f"LLM response missing keys. Raw response: {content}")
+                logger.warning(f"[Generative] LLM response missing keys. Raw: {content}")
                 return
+
             results = self.sp.search(q=f"track:{song_name} artist:{artist_name}", limit=1, type="track")
-            if not results['tracks']['items']: return
+            if not results['tracks']['items']:
+                logger.warning(f"[Generative] No Spotify results for '{song_name}' by '{artist_name}'.")
+                return
+
             track = results['tracks']['items'][0]
+            
+            # Avoid adding a song that's already in the main playlist
+            if track['id'] in self.playlist_tracks:
+                logger.info(f"[Generative] Skipping '{track['name']}' as it's already in the playlist.")
+                return
+
             features = self._get_reccobeats_features_batch([track['id']]).get(track['id'])
             if not features: return
+
             embedding = self._get_embedding(self._create_embedding_prompt(track, features))
             new_track = Track(id=track['id'], name=track['name'], artist=track['artists'][0]['name'], embedding=embedding)
+            
             logger.info(f"➕ [Generative] Adding to playlist and queue: '{new_track.name}' by {new_track.artist}")
-            # Add to Spotify playlist and queue
-            try:
-                self.sp.playlist_add_items(self.playlist_id, [new_track.id])
-            except Exception as e:
-                logger.warning(f"Failed adding new track to playlist: {e}")
+            
+            self.sp.playlist_add_items(self.playlist_id, [new_track.id])
             self.playback_queue.append(new_track.id)
             self.playlist_tracks[new_track.id] = new_track
+        
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.error(f"Error processing generative suggestion: {e}")
             if 'response' in locals() and response:
@@ -489,39 +538,57 @@ class IntelligentShuffler:
             logger.error(f"Unexpected error in generative suggestion: {e}", exc_info=True)
 
     def _add_llm_suggestion_based_on_top_scores(self):
-        # Get top 10 tracks by score
         if not self.playlist_tracks:
             return
+            
+        # Get top 10 tracks by score to use as a seed
         top_tracks = sorted(self.playlist_tracks.values(), key=lambda t: t.score, reverse=True)[:10]
-        history = "\n".join([f"- '{t.name}'" for t in top_tracks])
-        prompt = (f"Top tracks:\n{history}\n\nRecommend a new song. Respond with JSON: "
-                  '{"song_name": "SONG", "artist_name": "ARTIST"}')
+        prompt = self._build_generative_prompt(top_tracks)
+
+        if not prompt:
+            logger.warning("[LLM Suggestion] Could not build prompt, skipping.")
+            return
+
         try:
             response = ollama.chat(model=self.GENERATIVE_MODEL, messages=[{'role': 'user', 'content': prompt}], format="json")
             content = response['message']['content']
             recommendation = json.loads(content)
+            
             song_name, artist_name = recommendation.get('song_name'), recommendation.get('artist_name')
             if not song_name or not artist_name:
-                logger.warning(f"LLM response missing keys. Raw response: {content}")
+                logger.warning(f"[LLM Suggestion] LLM response missing keys. Raw: {content}")
                 return
+
             results = self.sp.search(q=f"track:{song_name} artist:{artist_name}", limit=1, type="track")
             if not results['tracks']['items']:
+                logger.warning(f"[LLM Suggestion] No Spotify results for '{song_name}' by '{artist_name}'.")
                 return
+
             track = results['tracks']['items'][0]
+
+            if track['id'] in self.playlist_tracks:
+                logger.info(f"[LLM Suggestion] Skipping '{track['name']}' as it's already in the playlist.")
+                return
+
             features = self._get_reccobeats_features_batch([track['id']]).get(track['id'])
             if not features:
                 return
+
             embedding = self._get_embedding(self._create_embedding_prompt(track, features))
             new_track = Track(id=track['id'], name=track['name'], artist=track['artists'][0]['name'], embedding=embedding)
-            logger.info(f"➕ [LLM] Adding to queue: '{new_track.name}' by {new_track.artist}")
+            
+            logger.info(f"➕ [LLM Suggestion] Adding to queue: '{new_track.name}' by {new_track.artist}")
+            
             self.playback_queue.append(new_track.id)
             self.playlist_tracks[new_track.id] = new_track
+            
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.error(f"Error processing LLM suggestion: {e}")
             if 'response' in locals() and response:
                 logger.debug(f"Raw LLM response causing error: {response.get('message', {}).get('content', 'N/A')}")
         except Exception as e:
             logger.error(f"Unexpected error in LLM suggestion: {e}", exc_info=True)
+
 
     def _reorder_queue_after_current(self, current_id):
         # Group tracks by state: remaining (not jumped/skipped/played), jumped, skipped, full_played
