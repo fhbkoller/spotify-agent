@@ -1,8 +1,10 @@
-spotipy
-python-dotenv
-tqdm
-sqlalchemy
-chromadb
 numpy
-requests
+spotipy
+tqdm
 ollama
+fastapi
+uvicorn
+requests
+SQLAlchemy
+chromadb
+aiohttp

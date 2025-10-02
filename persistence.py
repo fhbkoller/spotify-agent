@@ -22,15 +22,15 @@ EMBEDDING_COLLECTION_NAME = "song_embeddings"
 
 metadata = MetaData()
 
-### --- FIX: Renamed 'spotify_id' to 'id' to match the Track object --- ###
+### --- MENTORSHIP NOTE: REMOVED SCORE-RELATED COLUMNS --- ###
+# We no longer persist scores, so these columns are not needed in the main table definition
+# for new tables. The code will still work with old tables, it just won't use the columns.
 songs_table = Table(
     "songs",
     metadata,
     Column("id", String, primary_key=True),
     Column("name", String, nullable=False),
     Column("artist", String, nullable=False),
-    Column("score", Float, default=1.0),
-    Column("skip_count", Integer, default=0),
 )
 
 
@@ -57,21 +57,20 @@ class PersistenceManager:
                 found_tracks[row_dict['id']] = row_dict
 
         found_ids = list(found_tracks.keys())
-        # Fetch embeddings in chunks to avoid backend limits
         if found_ids:
             chunk_size = 100
             for i in range(0, len(found_ids), chunk_size):
                 batch_ids = found_ids[i:i+chunk_size]
-                embeddings_result = self.embedding_collection.get(ids=batch_ids, include=["embeddings"])
-                ids_with_embeddings = embeddings_result.get('ids')
-                if ids_with_embeddings is None:
-                    ids_with_embeddings = []
-                embeddings = embeddings_result.get('embeddings')
-                if embeddings is None:
-                    embeddings = []
-                for sid, embedding in zip(ids_with_embeddings, embeddings):
-                    if sid in found_tracks and embedding is not None:
-                        found_tracks[sid]['embedding'] = np.array(embedding)
+                try:
+                    embeddings_result = self.embedding_collection.get(ids=batch_ids, include=["embeddings"])
+                    ids_with_embeddings = embeddings_result.get('ids', [])
+                    embeddings = embeddings_result.get('embeddings', [])
+                    for sid, embedding in zip(ids_with_embeddings, embeddings):
+                        if sid in found_tracks and embedding is not None:
+                            found_tracks[sid]['embedding'] = np.array(embedding)
+                except Exception as e:
+                    logger.error(f"Error fetching embeddings for batch: {e}")
+
 
         missing_ids = [sid for sid in spotify_ids if sid not in found_tracks]
         
@@ -79,14 +78,11 @@ class PersistenceManager:
         return found_tracks, missing_ids
 
     def save_track(self, track_data: dict):
-        """Save or upsert the song row. Embedding is optional and saved separately if provided."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
         stmt = sqlite_insert(songs_table).values(
             id=track_data["id"],
             name=track_data["name"],
             artist=track_data["artist"],
-            score=1.0,
-            skip_count=0,
         ).on_conflict_do_nothing()
 
         with self.db_engine.connect() as conn:
@@ -95,36 +91,18 @@ class PersistenceManager:
 
         if 'embedding' in track_data and track_data['embedding'] is not None:
             self.save_embedding(track_data["id"], track_data["embedding"])
-        logger.debug(f"Saved track row '{track_data['name']}' to SQLite and optional embedding to Chroma.")
+        logger.debug(f"Saved track '{track_data['name']}' to persistence.")
 
     def save_embedding(self, track_id: str, embedding: np.ndarray):
         try:
-            self.embedding_collection.add(
+            self.embedding_collection.upsert(
                 ids=[track_id],
                 embeddings=[embedding.tolist()],
             )
-        except Exception:
-            try:
-                # Fallback to update if already exists
-                self.embedding_collection.update(
-                    ids=[track_id],
-                    embeddings=[embedding.tolist()],
-                )
-            except Exception as e:
+        except Exception as e:
                 logger.error(f"Failed to write embedding for {track_id}: {e}")
-
-    def update_track_stats(self, track_id: str, new_score: float, new_skip_count: int):
-        stmt = (
-            update(songs_table)
-            .where(songs_table.c.id == track_id)
-            .values(score=new_score, skip_count=new_skip_count)
-        )
-        with self.db_engine.connect() as conn:
-            conn.execute(stmt)
-            conn.commit()
-        logger.debug(f"Updated stats for track {track_id}: score={new_score:.2f}, skips={new_skip_count}")
         
-    def find_similar_tracks(self, vector: np.ndarray, n_results: int = 5, exclude_ids: list = None) -> list:
+    def find_similar_tracks(self, vector: np.ndarray, n_results: int = 5, exclude_ids: list = None, include_distances: bool = False) -> list:
         if exclude_ids is None:
             exclude_ids = []
         
@@ -139,6 +117,15 @@ class PersistenceManager:
             n_results=results_to_fetch,
         )
         
-        similar_ids = [sid for sid in results['ids'][0] if sid not in exclude_ids]
+        final_ids, final_distances = [], []
+        if results and results.get('ids') and results['ids'][0]:
+            for i, sid in enumerate(results['ids'][0]):
+                if sid not in exclude_ids:
+                    final_ids.append(sid)
+                    if results.get('distances') and results['distances'][0]:
+                        final_distances.append(results['distances'][0][i])
         
-        return similar_ids[:n_results]
+        if include_distances:
+            return list(zip(final_ids, final_distances))[:n_results]
+        else:
+            return final_ids[:n_results]

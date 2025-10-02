@@ -3,20 +3,21 @@ import time
 import json
 import ollama
 import spotipy
-import requests
+import asyncio
+import aiohttp
 import numpy as np
 import logging
 from tqdm import tqdm
 from spotipy.oauth2 import SpotifyOAuth
 from dataclasses import dataclass, field
-from threading import Thread, Event, Lock
+from threading import Thread, Event
 from queue import Queue, Empty
 
 from persistence import PersistenceManager
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-### --- FIX: Added the missing 'embedding' field --- ###
 @dataclass
 class Track:
     id: str
@@ -25,18 +26,18 @@ class Track:
     embedding: np.ndarray = field(repr=False)
     score: float = 1.0
     skip_count: int = 0
+    play_count: int = 0
+    last_event: str = 'fresh'
+    is_new: bool = False
 
 class IntelligentShuffler:
     EMBEDDING_MODEL = "mxbai-embed-large"
     GENERATIVE_MODEL = "qwen:7b"
     API_BATCH_SIZE = 40
-    SKIP_PENALTY = 0.5
-    FINISH_BONUS = 0.1
     POLLING_INTERVAL_SECONDS = 2
     SPOTIFY_QUEUE_HARD_LIMIT = 81
-    SIMILAR_BONUS = 0.02
-    SIMILAR_PENALTY = 0.01
-    JUMP_PENALTY = 0.2
+    RESHUFFLE_THRESHOLD = 5
+    AI_REQUEST_TIMEOUT = 15
 
     def __init__(self, playlist_id: str):
         self._setup_spotify_client()
@@ -45,22 +46,11 @@ class IntelligentShuffler:
         self.db = PersistenceManager()
         self.playlist_tracks: dict[str, Track] = {}
         self.playback_queue: list[str] = []
-        self.current_track_id = None
-        self.current_track_item = None
-        self.song_added_for_current_track = False
-        # Async/worker fields
         self._work_queue: Queue = Queue()
         self._stop_event: Event = Event()
         self._worker_thread: Thread | None = None
-        self._state_lock: Lock = Lock()
-        # Debounce
-        self._stable_track_counter: int = 0
-        self._events_since_last_queue_refresh: int = 0
-        self._QUEUE_REFRESH_EVENT_THRESHOLD: int = 1
-        # Snapshot of Spotify's next/previous for adjacency
-        self._last_spotify_next_id = None
-        self._last_spotify_prev_id = None
-        self._last_progress_ms_current = 0
+        self._evaluation_counter = 0
+        self._eliminated_track_count = 0
 
     def _setup_spotify_client(self):
         scope = (
@@ -68,603 +58,362 @@ class IntelligentShuffler:
             "playlist-modify-public playlist-read-private user-library-read"
         )
         self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope))
-        logger.debug("Spotify client set up successfully.")
 
     def initialize(self):
         logger.info("Initializing Intelligent Shuffle Agent...")
         logger.info("Syncing tracks from target playlist...")
         playlist_items = []
-        limit = 100
         offset = 0
         while True:
-            results = self.sp.playlist_items(self.playlist_id, limit=limit, offset=offset)
-            items = results.get("items", [])
+            response = self.sp.playlist_items(self.playlist_id, offset=offset, limit=100)
+            if not response or not response.get("items"): break
+            items = response["items"]
             playlist_items.extend(items)
-            if len(items) < limit:
-                break
-            offset += limit
-        logger.info(f"Fetched a total of {len(playlist_items)} items from Spotify playlist.")
-        playlist_ids = [item['track']['id'] for item in playlist_items if item.get('track') and item['track'].get('id')]
+            if len(items) < 100: break
+            offset += 100
+        
+        playlist_ids = [item['track']['id'] for item in playlist_items if item.get('track') and item.get('track').get('id')]
         self.playlist_tracks = self._sync_tracks_with_db(playlist_ids)
         logger.info(f"Loaded {len(self.playlist_tracks)} tracks for playlist.")
-        self._reshuffle_queue()
-        # Start background worker
-        try:
-            self._worker_thread = Thread(target=self._worker_loop, name="ShufflerWorker", daemon=True)
-            self._worker_thread.start()
-        except Exception as e:
-            logger.error(f"Failed to start background worker: {e}")
+        
+        self.reset_all_track_scores()
+        self._reshuffle_internal_queue_only()
+        
+        self._worker_thread = Thread(target=self._worker_loop, name="ShufflerWorker", daemon=True)
+        self._worker_thread.start()
 
-    def _reshuffle_queue(self):
-        # Shuffle/reshuffle the queue based on scores
+    def reset_all_track_scores(self):
+        logger.info("Resetting all in-memory track scores and states for the new session.")
+        for track in self.playlist_tracks.values():
+            track.score = 1.0
+            track.skip_count = 0
+            track.play_count = 0
+            track.last_event = 'fresh'
+            track.is_new = False
+
+    def _reshuffle_internal_queue_only(self):
         if not self.playlist_tracks:
             self.playback_queue = []
             return
-        scores = np.array([t.score for t in self.playlist_tracks.values()])
-        if scores.sum() == 0:
-            scores = np.ones(len(self.playlist_tracks))
-        probs = scores / scores.sum()
-        self.playback_queue = list(np.random.choice(list(self.playlist_tracks.keys()), size=len(self.playlist_tracks), replace=False, p=probs))
-        logger.info(f"Playback queue reshuffled: {[self.playlist_tracks[tid].name for tid in self.playback_queue]}")
+        
+        active_tracks = {tid: t for tid, t in self.playlist_tracks.items() if t.score > 0}
+        
+        eliminated_count = len(self.playlist_tracks) - len(active_tracks)
+        if eliminated_count > 0:
+            self._eliminated_track_count += eliminated_count
+            logger.info(f"{eliminated_count} tracks were eliminated due to low score. Total to replace: {self._eliminated_track_count}")
+            self.playlist_tracks = active_tracks
+
+        remaining = sorted([t for t in active_tracks.values() if t.last_event == 'fresh'], key=lambda t: t.score, reverse=True)
+        skipped = sorted([t for t in active_tracks.values() if t.last_event == 'skipped'], key=lambda t: t.score, reverse=True)
+        played = sorted([t for t in active_tracks.values() if t.last_event == 'played'], key=lambda t: t.score, reverse=True)
+        newly_added = [t for t in active_tracks.values() if t.is_new]
+
+        self.playback_queue = (
+            [t.id for t in remaining] + [t.id for t in skipped] +
+            [t.id for t in newly_added] + [t.id for t in played]
+        )
+        
+        for track in newly_added: track.is_new = False
+        logger.info("Internal playback queue has been re-sorted.")
+
+    def _reshuffle_and_update_spotify_queue(self):
+        self._reshuffle_internal_queue_only()
+        
+        if self._eliminated_track_count > 0:
+            logger.info(f"Queueing generative search to replace {self._eliminated_track_count} eliminated tracks.")
+            for _ in range(self._eliminated_track_count):
+                self._work_queue.put(("add_new_song", {}))
+            self._eliminated_track_count = 0
+
+        if self._evaluation_counter >= self.RESHUFFLE_THRESHOLD:
+            logger.info("Reshuffle threshold reached. Replacing Spotify's live queue.")
+            self._enqueue_next_tracks()
+            self._evaluation_counter = 0
 
     def _sync_tracks_with_db(self, spotify_ids: list[str]) -> dict[str, Track]:
         cache = {}
         if not spotify_ids: return cache
         found_tracks_data, missing_ids = self.db.get_tracks_by_ids(spotify_ids)
-        # Separate: rows present (with or without embedding) vs truly absent rows
-        ids_missing_embeddings = [tid for tid, t in found_tracks_data.items() if t.get('embedding') is None]
-        truly_missing_ids = list(set(missing_ids))
-        # For present rows, construct Track objects; if embedding is missing, defer embedding usage
+        
         for track_id, track_data in found_tracks_data.items():
             embedding = track_data.get('embedding')
-            if embedding is not None:
-                cache[track_id] = Track(**track_data)
-            else:
-                # Create placeholder Track without embedding for now
-                cache[track_id] = Track(id=track_data['id'], name=track_data['name'], artist=track_data['artist'], embedding=np.zeros(384))
-        if found_tracks_data:
-            logger.info(f"Loaded {len(found_tracks_data)} tracks from local database.")
-        # Fetch remote data for tracks that are truly absent OR missing embeddings
-        ids_to_fetch = list(set(truly_missing_ids + ids_missing_embeddings))
-        if ids_to_fetch:
-            logger.info(f"Fetching data for {len(ids_to_fetch)} tracks missing locally (new or no embedding)...")
-            batches = [ids_to_fetch[i:i + self.API_BATCH_SIZE] for i in range(0, len(ids_to_fetch), self.API_BATCH_SIZE)]
-            for id_batch in tqdm(batches, desc="Syncing new tracks"):
-                spotify_tracks = self.sp.tracks(id_batch)['tracks']
-                recco_features = self._get_reccobeats_features_batch(id_batch)
-                for track_info in spotify_tracks:
-                    if not track_info: continue
-                    tid = track_info['id']
-                    track_data = {"id": tid, "name": track_info['name'], "artist": track_info['artists'][0]['name']}
-                    # Ensure row exists regardless of feature availability
-                    self.db.save_track(track_data)
-                    # Build prompt using ReccoBeats or Spotify features, fallback to minimal text
-                    feats = recco_features.get(tid) or {}
-                    try:
-                        prompt = self._create_embedding_prompt(track_info, feats) if feats else f"{track_info['name']} by {track_info['artists'][0]['name']}"
-                        embedding = self._get_embedding(prompt)
-                        self.db.save_embedding(tid, embedding)
-                        cache[tid] = Track(id=tid, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=embedding)
-                    except Exception:
-                        # If embedding fails, keep placeholder; will recover on next run
-                        if tid not in cache:
-                            cache[tid] = Track(id=tid, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=np.zeros(384))
-        return cache
+            cache[track_id] = Track(id=track_id, name=track_data['name'], artist=track_data['artist'], embedding=embedding if embedding is not None else np.zeros(384))
 
-    def reset_queue_weights(self):
-        """Reset the weights (scores) of all songs in the current queue to the initial value and update the DB."""
-        for track_id in self.playback_queue:
-            if track_id in self.playlist_tracks:
-                track = self.playlist_tracks[track_id]
-                track.score = 1.0
-                track.skip_count = 0
-                self.db.update_track_stats(track.id, track.score, track.skip_count)
-        logger.info("All queue track weights reset to 1.0.")
+        ids_to_fetch = list(set(missing_ids))
+        if ids_to_fetch:
+            for id_batch in tqdm([ids_to_fetch[i:i + self.API_BATCH_SIZE] for i in range(0, len(ids_to_fetch), self.API_BATCH_SIZE)], desc="Syncing new tracks"):
+                for track_info in self.sp.tracks(id_batch)['tracks']:
+                    if not track_info: continue
+                    tid, tname, tartist = track_info['id'], track_info['name'], track_info['artists'][0]['name']
+                    embedding = self._get_embedding(f"{tname} by {tartist}")
+                    track_data = {"id": tid, "name": tname, "artist": tartist, "embedding": embedding}
+                    self.db.save_track(track_data)
+                    cache[tid] = Track(id=tid, name=tname, artist=tartist, embedding=embedding)
+        return cache
 
     def run(self):
         logger.info("Starting playback loop...")
-        # Do not auto-start; only monitor
-        playback = self.sp.current_playback()
-        last_track_id = self.current_track_id
-        last_progress_ms = 0
-        last_duration_ms = 0
-        previous_next_spotify_id = None  # next track snapshot from previous poll
-        while True:
+        last_known_track_id, last_known_progress_ms = None, 0
+
+        try:
+            initial_playback = self.sp.current_playback()
+            if initial_playback and initial_playback.get('item'):
+                last_known_track_id = initial_playback['item']['id']
+                logger.info(f"Initial track detected: '{initial_playback['item']['name']}'")
+        except Exception as e:
+            logger.error(f"Could not get initial playback state: {e}")
+
+        while not self._stop_event.is_set():
             try:
                 playback = self.sp.current_playback()
-                if not playback or not playback.get("is_playing"):
+                if not playback or not playback.get("is_playing") or not playback.get("item"):
                     time.sleep(self.POLLING_INTERVAL_SECONDS)
                     continue
-                item = playback.get("item")
-                if not item or item.get('type') != 'track':
-                    time.sleep(self.POLLING_INTERVAL_SECONDS)
-                    continue
-                new_id = item["id"]
-                progress_ms = playback.get('progress_ms', 0)
-                duration = item.get('duration_ms', 0)
-                # Pull Spotify queue to capture the NEXT track for this poll
-                current_next_spotify_id = None
-                try:
-                    get_queue = getattr(self.sp, 'current_user_queue', None) or getattr(self.sp, 'queue', None)
-                    if callable(get_queue):
-                        q = get_queue()
-                        queue_items = q.get('queue', []) if isinstance(q, dict) else []
-                        if queue_items:
-                            current_next_spotify_id = queue_items[0].get('id')
-                except Exception:
-                    pass
-                # Pull Spotify adjacency (previous and next) every poll
-                try:
-                    get_queue = getattr(self.sp, 'current_user_queue', None) or getattr(self.sp, 'queue', None)
-                    if callable(get_queue):
-                        q = get_queue()
-                        queue_items = q.get('queue', []) if isinstance(q, dict) else []
-                        self._last_spotify_next_id = (queue_items[0].get('id') if queue_items else None)
-                        # Previous is not provided directly; best-effort: currently_playing from previous poll
-                        # We'll keep previous track id via last_track_id already
-                except Exception:
-                    pass
-                # Detect skip-back: same track, but progress resets to near zero
-                skip_back = (
-                    new_id == last_track_id and progress_ms < 5000 and last_progress_ms > 10000
-                )
-                # Detect skip to previous track
-                skip_to_previous = (
-                    new_id != last_track_id and self.playback_queue and self.playback_queue and self.playback_queue[-1] == new_id
-                )
-                # Determine event classification based on the PREVIOUS track's progress/duration
-                prev_duration_ms = last_duration_ms
-                fully_played_prev = new_id != last_track_id and (prev_duration_ms > 0 and last_progress_ms >= (prev_duration_ms * 0.9))
-                # Adjacent if the new track equals the next track snapshot captured on the PREVIOUS poll
-                is_adjacent_next_spotify = bool(previous_next_spotify_id and new_id == previous_next_spotify_id)
-                # Jump occurs when user selects a non-adjacent track (not next/previous) without full play
-                jump = (new_id != last_track_id and not skip_back and not skip_to_previous and not fully_played_prev and not is_adjacent_next_spotify)
-                if new_id != last_track_id:
-                    if not skip_to_previous and not skip_back:
-                        # Defer evaluation to worker; decide skipped vs jumped here
-                        if self.current_track_item:
-                            played_duration = last_progress_ms
-                            skipped = (not fully_played_prev) and (is_adjacent_next_spotify or skip_to_previous)
-                            try:
-                                self._work_queue.put(("evaluate", {"track_id": last_track_id, "skipped": bool(skipped), "jumped": bool(jump)}))
-                            except Exception:
-                                pass
-                    # Defer pruning and LLM fill to worker
-                    try:
-                        self._work_queue.put(("prune_and_fill", {}))
-                    except Exception:
-                        pass
-                    # Pop the next track from the queue if it matches new_id
-                    if self.playback_queue and self.playback_queue[0] == new_id:
-                        self.playback_queue.pop(0)
-                    self.current_track_id, self.current_track_item = new_id, item
-                    last_progress_ms, self.song_added_for_current_track = 0, False
-                    # Debounced reorder/enqueue via worker only if playing target playlist
-                    try:
-                        context = playback.get('context') or {}
-                        ctx_uri = context.get('uri')
-                        is_target_playlist = isinstance(ctx_uri, str) and self.playlist_id in ctx_uri
-                    except Exception:
-                        is_target_playlist = False
-                    if is_target_playlist:
-                        self._events_since_last_queue_refresh += 1
-                        try:
-                            self._work_queue.put(("maybe_reorder", {"current_id": new_id, "reason": "track_change"}))
-                        except Exception:
-                            pass
-                    if new_id in self.playlist_tracks:
-                        logger.info(f"🎶 Now Playing (Managed): '{item['name']}' by {item['artists'][0]['name']}")
-                    else:
-                        logger.info(f"🎶 Now Playing (Unmanaged): '{item['name']}' by {item['artists'][0]['name']}'")
-                        logger.warning("Current track is not in the target playlist. Scoring will be paused.")
-                last_progress_ms = progress_ms
-                last_duration_ms = duration
-                last_track_id = new_id
-                # Update previous_next_spotify_id for the next loop iteration
-                previous_next_spotify_id = current_next_spotify_id
-                if not self.song_added_for_current_track and duration > 0 and progress_ms > (duration * 0.80):
-                    try:
-                        self._work_queue.put(("add_new_song", {}))
-                        self.song_added_for_current_track = True
-                    except Exception:
-                        pass
+
+                current_track_id = playback['item']['id']
+                
+                if current_track_id != last_known_track_id:
+                    track_for_logging = self.playlist_tracks.get(last_known_track_id, 
+                                                                 Track(id=last_known_track_id, name=f"ID: {last_known_track_id}", artist="Unknown", embedding=np.array([])))
+                    track_name = track_for_logging.name
+                    logger.info(f"Track change detected: Now playing '{playback['item']['name']}'")
+                    
+                    if last_known_track_id in self.playlist_tracks:
+                        last_track_info = self.sp.track(last_known_track_id)
+                        last_duration_ms = last_track_info.get('duration_ms', 0)
+                        fully_played = last_duration_ms > 0 and last_known_progress_ms >= (last_duration_ms * 0.95)
+                        
+                        logger.info(f"Queueing evaluation for previous track '{track_name}' (fully_played: {fully_played})")
+                        self._work_queue.put(("evaluate", {"track_id": last_known_track_id, "skipped": not fully_played}))
+
+                    last_known_track_id = current_track_id
+                
+                last_known_progress_ms = playback.get('progress_ms', 0)
+
             except Exception as e:
                 logger.error(f"Error in playback loop: {e}", exc_info=True)
-                time.sleep(30)
+                time.sleep(10)
             time.sleep(self.POLLING_INTERVAL_SECONDS)
 
     def _worker_loop(self):
         logger.info("Background worker started.")
-        while not getattr(self, "_stop_event", Event()).is_set():
+        asyncio.run(self._async_worker())
+
+    async def _async_worker(self):
+        while not self._stop_event.is_set():
             try:
-                task, payload = self._work_queue.get(timeout=1)
-            except Exception:
-                continue
-            try:
-                if task == "enqueue":
-                    self._enqueue_next_tracks()
-                elif task == "evaluate":
-                    tid = payload.get("track_id")
-                    skipped_flag = payload.get("skipped")
-                    jumped_flag = payload.get("jumped")
-                    if tid is not None:
-                        self._update_scores(tid, skipped=bool(skipped_flag), jumped=bool(jumped_flag))
-                elif task == "prune_and_fill":
-                    to_remove = [tid for tid in self.playback_queue if tid in self.playlist_tracks and self.playlist_tracks[tid].score <= 0]
-                    for tid in to_remove:
-                        try:
-                            logger.info(f"Removing '{self.playlist_tracks[tid].name}' from queue due to score <= 0.")
-                        except KeyError:
-                            pass
-                        self.playback_queue = [x for x in self.playback_queue if x != tid]
-                        if tid in self.playlist_tracks:
-                            del self.playlist_tracks[tid]
-                        self._add_llm_suggestion_based_on_top_scores()
-                elif task == "maybe_reorder":
-                    current_id = payload.get("current_id")
-                    if self._events_since_last_queue_refresh >= getattr(self, "_QUEUE_REFRESH_EVENT_THRESHOLD", 5):
-                        self._reorder_queue_after_current(current_id)
-                        self._enqueue_next_tracks()
-                        self._events_since_last_queue_refresh = 0
-                elif task == "add_new_song":
-                    self._add_new_song()
-            except Exception as e:
-                logger.error(f"Worker task {task} failed: {e}", exc_info=True)
-            finally:
+                task, payload = self._work_queue.get_nowait()
                 try:
+                    if task == "evaluate":
+                        await self._update_scores_async(payload["track_id"], skipped=payload["skipped"])
+                    elif task == "add_new_song":
+                        await self._add_generative_song_async()
+                except Exception as e:
+                    logger.error(f"Error processing worker task '{task}': {e}", exc_info=True)
+                finally:
                     self._work_queue.task_done()
-                except Exception:
-                    pass
+            except Empty:
+                await asyncio.sleep(0.1)
 
-    def _update_scores(self, track_id: str, skipped: bool, jumped: bool = False):
-        # Log evaluated track's actual name, not the current playing item
-        eval_name = self.playlist_tracks.get(track_id).name if track_id in self.playlist_tracks else track_id
-        logger.info(f"Evaluating: '{eval_name}' (skipped: {skipped}, jumped: {jumped})")
-        
-        if not track_id or track_id not in self.playlist_tracks:
-            return
-
-        track = self.playlist_tracks[track_id]
-        if jumped:
-            track.score = track.score * self.JUMP_PENALTY
-            setattr(track, 'was_jumped', True)
-            logger.info(f"⏩ Score for '{track.name}' jumped to {track.score:.2f}")
-        elif skipped:
-            track.score = track.score * self.SKIP_PENALTY
-            track.skip_count += 1
-            logger.info(f"🔻 Score for '{track.name}' decreased to {track.score:.2f}")
-            # Decrement similar songs
-            similar_ids = self.db.find_similar_tracks(vector=track.embedding, n_results=5, exclude_ids=[track_id])
-            for sid in similar_ids:
-                if sid in self.playlist_tracks:
-                    similar_track = self.playlist_tracks[sid]
-                    similar_track.score -= self.SIMILAR_PENALTY
-                    self.db.update_track_stats(similar_track.id, similar_track.score, similar_track.skip_count)
-                    logger.info(f"🔸 Similar track '{similar_track.name}' received penalty, new score: {similar_track.score:.2f}")
-        else:
-            track.score = track.score + self.FINISH_BONUS
-            setattr(track, 'played_full', True)
-            logger.info(f"🔺 Score for '{track.name}' increased to {track.score:.2f}")
-            # Increment similar songs
-            similar_ids = self.db.find_similar_tracks(vector=track.embedding, n_results=5, exclude_ids=[track_id])
-            for sid in similar_ids:
-                if sid in self.playlist_tracks:
-                    similar_track = self.playlist_tracks[sid]
-                    similar_track.score += self.SIMILAR_BONUS
-                    self.db.update_track_stats(similar_track.id, similar_track.score, similar_track.skip_count)
-                    logger.info(f"🔹 Similar track '{similar_track.name}' received bonus, new score: {similar_track.score:.2f}")
-        self.db.update_track_stats(track.id, track.score, track.skip_count)
-        if track.skip_count >= 3:
-            logger.warning(f"Removing '{track.name}' from queue due to repeated skips.")
-            # Remove from queue if present, but do not touch the playlist
-            self.playback_queue = [tid for tid in self.playback_queue if tid != track_id]
-            del self.playlist_tracks[track_id]
-
-    def _get_next_track(self, last_played_id: str = None) -> str:
-        # Pop the next track from the queue, reshuffle if empty
-        if not self.playback_queue:
-            self._reshuffle_queue()
-        if not self.playback_queue:
-            return None
-        next_id = self.playback_queue.pop(0)
-        return next_id
-
-    def _add_new_song(self):
-        if np.random.rand() > 0.3: self._add_similar_song()
-        else: self._add_generative_song()
-
-    def _add_similar_song(self):
-        if not self.current_track_id or self.current_track_id not in self.playlist_tracks: return
-        current_track = self.playlist_tracks[self.current_track_id]
-        
-        # If current track has placeholder embedding (zeros), do not attempt similarity
-        if current_track.embedding is None or (isinstance(current_track.embedding, np.ndarray) and not current_track.embedding.any()):
-            logger.info("[Similarity] Current track missing embedding; skipping similarity search.")
-            return
-        similar_ids = self.db.find_similar_tracks(vector=current_track.embedding, n_results=10, exclude_ids=list(self.playlist_tracks.keys()))
-        
-        if not similar_ids:
-            logger.info("[Similarity] No suitable new tracks found in database.")
-            return
-        
-        # Prefer the highest scoring among the similar candidates we know
-        candidate_id = None
-        for sid in similar_ids:
-            if sid in self.playlist_tracks:
-                candidate_id = sid
-                break
-        if candidate_id is None:
-            candidate_id = similar_ids[0]
-        newly_synced = self._sync_tracks_with_db([candidate_id])
-        candidate = newly_synced.get(candidate_id)
-        
-        if candidate:
-            logger.info(f"✨ [Similarity] Adding to queue: '{candidate.name}' by {candidate.artist}")
-            self.playback_queue.append(candidate.id)
-            self.playlist_tracks[candidate.id] = candidate  # Optionally track for scoring
-
-    def _get_reccobeats_features_batch(self, ids: list[str]) -> dict:
-        if not ids: return {}
+    async def _ollama_chat_async(self, prompt: str) -> dict | None:
+        payload = {"model": self.GENERATIVE_MODEL, "messages": [{"role": "user", "content": prompt}], "format": "json", "stream": False}
         try:
-            response = requests.get("https://api.reccobeats.com/v1/audio-features", params={"ids": ",".join(ids)}, headers={"Accept": "application/json"})
-            response.raise_for_status()
-            data = response.json().get('content', [])
-            if len(ids) != len(data):
-                logger.warning(f"ReccoBeats ID/result mismatch. Sent {len(ids)}, received {len(data)}.")
-                # Proceed with partial mapping instead of dropping the whole batch
-            return {sid: f for sid, f in zip(ids, data)}
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            logger.error(f"ReccoBeats API error: {e}")
-            return {}
+            timeout = aiohttp.ClientTimeout(total=self.AI_REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post("http://127.0.0.1:11434/api/chat", json=payload) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                    raw_content = result.get('message', {}).get('content', '')
+                    clean_content = raw_content.strip().replace("'", '"').replace('`', '')
+                    if "}" not in clean_content and "{" in clean_content: clean_content += "}"
+                    return json.loads(clean_content)
+        except asyncio.TimeoutError:
+            logger.error(f"Ollama request timed out after {self.AI_REQUEST_TIMEOUT} seconds.")
+            return None
+        except json.JSONDecodeError:
+            logger.error(f"Ollama returned malformed JSON! Raw content: {raw_content}")
+            return None
+        except Exception as e:
+            logger.error(f"Error communicating with Ollama: {e}")
+            return None
+
+    async def _get_ai_score_multiplier_async(self, track: Track, event: str) -> dict | None:
+        logger.info(f"Attempting to get AI score multiplier for '{track.name}'...")
+        prompt = f"""
+**Instruction**: Compute a score multiplier for a song based on user action.
+**Data**:
+- Action: **{event}**
+- History: Played {track.play_count} times.
+**Rules**:
+1. If "Action" is "skipped", multiplier MUST be between 0.7 and 0.9.
+2. If "Action" is "fully played", multiplier MUST be between 1.05 and 1.2.
+**Output (JSON ONLY)**:
+{{"score_multiplier": <float>}}
+"""
+        return await self._ollama_chat_async(prompt)
+
+    def _normalize_distance_to_similarity(self, distance: float, min_dist: float, max_dist: float) -> float:
+        """Converts a raw distance to a 0-1 similarity score."""
+        if max_dist == min_dist:
+            return 1.0  # All distances are the same, so they are all equally similar
+        # Invert the score so that smaller distances are closer to 1.0
+        return 1.0 - ((distance - min_dist) / (max_dist - min_dist))
+
+    async def _update_scores_async(self, track_id: str, skipped: bool):
+        track = self.playlist_tracks.get(track_id)
+        if not track: return
+
+        self._evaluation_counter += 1
+        event = "skipped" if skipped else "fully played"
+        track.last_event = event
+        logger.info(f"Evaluating: '{track.name}' ({event}). Eval count: {self._evaluation_counter}")
+
+        final_multiplier = 0.8 if skipped else 1.1
+        ai_response = await self._get_ai_score_multiplier_async(track, event)
+        
+        if ai_response and 'score_multiplier' in ai_response:
+            ai_multiplier = ai_response['score_multiplier']
+            if (skipped and ai_multiplier < 1.0) or (not skipped and ai_multiplier > 1.0):
+                final_multiplier = ai_multiplier
+                logger.info(f"🤖 AI provided a valid multiplier: {final_multiplier:.2f}")
+            else:
+                logger.warning(f"AI returned an invalid multiplier ({ai_multiplier:.2f} for a '{event}' event). Using fallback.")
+        else:
+            logger.warning("AI scoring failed or timed out. Applying default fallback scoring.")
+        
+        original_score = track.score
+        new_score = original_score * final_multiplier
+        score_delta = new_score - original_score
+        track.score = new_score
+        
+        track.skip_count += 1 if skipped else 0
+        track.play_count += 0 if skipped else 1
+        logger.info(f"Adjustment for '{track.name}': score changed by {score_delta:+.3f}, new score={track.score:.2f}")
+
+        if track.embedding.any():
+            logger.debug("--- Start Similarity Scoring Debug ---")
+            logger.debug(f"Primary track '{track.name}': original_score={original_score:.3f}, new_score={new_score:.3f}, score_delta={score_delta:+.3f}")
+            
+            similar_ids_and_distances = self.db.find_similar_tracks(vector=track.embedding, n_results=3, include_distances=True, exclude_ids=[track_id])
+            
+            dist_list = [(sid, dist) for sid, dist in similar_ids_and_distances if sid in self.playlist_tracks]
+            if dist_list:
+                min_dist = min(d for _, d in dist_list)
+                max_dist = max(d for _, d in dist_list)
+                
+                for sid, dist in dist_list:
+                    sim_track = self.playlist_tracks[sid]
+                    similarity = self._normalize_distance_to_similarity(dist, min_dist, max_dist)
+                    adjustment = score_delta * similarity * 0.5
+
+                    logger.debug(f"  -> Similar track '{sim_track.name}':")
+                    logger.debug(f"     Raw Distance = {dist:.3f} (min={min_dist:.3f}, max={max_dist:.3f})")
+                    logger.debug(f"     Normalized Similarity = {similarity:.3f}")
+                    logger.debug(f"     Adjustment = (delta){score_delta:+.3f} * (similarity){similarity:.3f} * 0.5 = {adjustment:+.3f}")
+                    
+                    sim_track.score += adjustment
+                    logger.info(f"  -> Similar track '{sim_track.name}' adjustment: {adjustment:+.3f}, new score: {sim_track.score:.2f}")
+            logger.debug("--- End Similarity Scoring Debug ---")
+        
+        self._reshuffle_and_update_spotify_queue()
+
+    async def _add_generative_song_async(self, max_retries: int = 3):
+        if not self.playlist_tracks: return
+        
+        for attempt in range(max_retries):
+            logger.info(f"Generative search attempt {attempt + 1}/{max_retries}...")
+            seed_tracks = sorted(self.playlist_tracks.values(), key=lambda t: t.score, reverse=True)[:5]
+            prompt = self._build_generative_prompt(seed_tracks)
+            if not prompt: return
+
+            recommendation = await self._ollama_chat_async(prompt)
+            
+            song_name, artist_name = None, None
+            if recommendation:
+                song_name = recommendation.get('song_name') or recommendation.get('song_ name')
+                artist_name = recommendation.get('artist_name') or recommendation.get('artist_ name')
+
+            if not song_name or not artist_name:
+                logger.warning(f"Generative LLM returned invalid data on attempt {attempt + 1}.")
+                continue
+
+            logger.info(f"AI suggested: '{song_name}' by '{artist_name}'. Searching on Spotify...")
+            results = self.sp.search(q=f"track:{song_name} artist:{artist_name}", limit=1, type="track")
+            
+            if not results['tracks']['items']:
+                logger.warning(f"No Spotify results for the suggested track. Retrying...")
+                continue
+
+            track, track_id = results['tracks']['items'][0], results['tracks']['items'][0]['id']
+            if track_id in self.playlist_tracks:
+                logger.info(f"Skipping '{track['name']}' as it's already in the playlist. Retrying...")
+                continue
+
+            embedding = self._get_embedding(f"{track['name']} by {track['artists'][0]['name']}")
+            new_track = Track(id=track_id, name=track['name'], artist=track['artists'][0]['name'], embedding=embedding, is_new=True)
+            self.db.save_track({"id": track_id, "name": new_track.name, "artist": new_track.artist, "embedding": embedding})
+            self.playlist_tracks[track_id] = new_track
+            
+            self.sp.playlist_add_items(self.playlist_id, [track_id])
+            self.sp.add_to_queue(f"spotify:track:{track_id}")
+            logger.info(f"➕ [Generative] Added '{new_track.name}' to playlist and current queue.")
+            return
+
+        logger.error(f"Generative search failed after {max_retries} attempts.")
+
+    def _build_generative_prompt(self, seed_tracks: list[Track]) -> str:
+        if not seed_tracks: return ""
+        artists_to_exclude = {t.artist for t in seed_tracks}
+        track_analysis_str = "\n".join([f"- \"{t.name}\" by {t.artist}" for t in seed_tracks])
+        return f"""
+**Instruction**: Recommend ONE new song.
+**Seed Tracks**:
+{track_analysis_str}
+**Rules**:
+1. The song MUST be sonically similar to the seed tracks.
+2. The song MUST NOT be by any of these artists: {', '.join(artists_to_exclude)}.
+3. The song MUST be a well-known track likely to be found on Spotify.
+**Output (JSON ONLY)**:
+{{"song_name": "SONG_TITLE", "artist_name": "ARTIST_NAME"}}
+"""
 
     def _get_embedding(self, text: str) -> np.ndarray:
         try:
             return np.array(ollama.embeddings(model=self.EMBEDDING_MODEL, prompt=text)["embedding"])
         except Exception as e:
             logger.error(f"Ollama embedding error: {e}")
-            raise
+            return np.zeros(384)
 
-    def _create_embedding_prompt(self, track: dict, features: dict) -> str:
-        # Weighted features prompt; exclude title, de-emphasize artist
-        artist = track['artists'][0]['name']
-        tempo = features.get('tempo')
-        dance = features.get('danceability')
-        energy = features.get('energy') if isinstance(features, dict) else None
-        valence = features.get('valence') if isinstance(features, dict) else None
-        parts = []
-        if tempo is not None:
-            parts.append(f"tempo:{tempo}")
-        if dance is not None:
-            parts.append(f"danceability:{dance}")
-        if energy is not None:
-            parts.append(f"energy:{energy}")
-        if valence is not None:
-            parts.append(f"valence:{valence}")
-        # Add low-weight artist context
-        parts.append(f"artist:{artist}")
-        return " ".join(parts)
-
-    def _build_generative_prompt(self, seed_tracks: list[Track]) -> str:
-        """Builds a detailed, context-rich prompt for the generative model."""
-        if not seed_tracks:
-            return ""
-
-        # Fetch audio features for the seed tracks to enrich the prompt
-        seed_ids = [t.id for t in seed_tracks]
-        features_map = self._get_reccobeats_features_batch(seed_ids)
-        
-        # Build the detailed analysis section of the prompt
-        track_analysis_str = ""
-        artists_to_exclude = set()
-        for track in seed_tracks:
-            artists_to_exclude.add(track.artist)
-            features = features_map.get(track.id)
-            track_analysis_str += f"* **Track:** \"{track.name}\" by {track.artist}\n"
-            if features:
-                track_analysis_str += (
-                    f"    * **Key Features:** "
-                    f"danceability={features.get('danceability', 'N/A')}, "
-                    f"energy={features.get('energy', 'N/A')}, "
-                    f"valence={features.get('valence', 'N/A')}\n"
-                )
-
-        prompt = f"""You are an expert music curator with deep knowledge of genres, moods, and sonic textures.
-Your task is to recommend ONE new song that is sonically and thematically similar to the following tracks.
-Do not recommend another song by any of the following artists: {', '.join(artists_to_exclude)}.
-
-**Analysis of Provided Tracks:**
-{track_analysis_str}
-**Your Recommendation:**
-Based on this analysis, recommend one new song that shares a similar vibe and audio features.
-
-Respond ONLY with a single, valid JSON object in the format:
-{{"song_name": "SONG_TITLE", "artist_name": "ARTIST_NAME"}}
-"""
-        return prompt
-
-    def _add_generative_song(self):
-        if not self.playlist_tracks: return
-        
-        # Use the last 5 played tracks as the seed for the recommendation
-        seed_tracks = list(self.playlist_tracks.values())[-5:]
-        prompt = self._build_generative_prompt(seed_tracks)
-
-        if not prompt:
-            logger.warning("[Generative] Could not build prompt, skipping.")
+    def _enqueue_next_tracks(self):
+        if not self.playback_queue:
+            logger.warning("Internal queue is empty; cannot update Spotify.")
             return
 
         try:
-            response = ollama.chat(model=self.GENERATIVE_MODEL, messages=[{'role': 'user', 'content': prompt}], format="json")
-            content = response['message']['content']
-            
-            # Robust parsing
-            recommendation = json.loads(content)
-            song_name = recommendation.get('song_name')
-            artist_name = recommendation.get('artist_name')
+            devices = self.sp.devices()
+            active_device = next((d for d in devices['devices'] if d['is_active']), None)
+            if not active_device:
+                logger.warning("No active Spotify device found. Cannot replace queue.")
+                return
+            device_id = active_device['id']
 
-            if not song_name or not artist_name:
-                logger.warning(f"[Generative] LLM response missing keys. Raw: {content}")
+            current_playback = self.sp.current_playback()
+            if not current_playback or not current_playback.get('item'):
+                logger.warning("Nothing is currently playing. Cannot replace queue without interrupting.")
                 return
 
-            results = self.sp.search(q=f"track:{song_name} artist:{artist_name}", limit=1, type="track")
-            if not results['tracks']['items']:
-                logger.warning(f"[Generative] No Spotify results for '{song_name}' by '{artist_name}'.")
-                return
-
-            track = results['tracks']['items'][0]
+            currently_playing_id = current_playback['item']['id']
             
-            # Avoid adding a song that's already in the main playlist
-            if track['id'] in self.playlist_tracks:
-                logger.info(f"[Generative] Skipping '{track['name']}' as it's already in the playlist.")
-                return
+            final_queue_ids = [currently_playing_id] + [tid for tid in self.playback_queue if tid != currently_playing_id]
+            queue_uris = [f"spotify:track:{tid}" for tid in final_queue_ids[:self.SPOTIFY_QUEUE_HARD_LIMIT]]
 
-            features = self._get_reccobeats_features_batch([track['id']]).get(track['id'])
-            if not features: return
+            self.sp.start_playback(device_id=device_id, uris=queue_uris)
+            
+            if current_playback.get('progress_ms'):
+                self.sp.seek_track(current_playback['progress_ms'])
 
-            embedding = self._get_embedding(self._create_embedding_prompt(track, features))
-            new_track = Track(id=track['id'], name=track['name'], artist=track['artists'][0]['name'], embedding=embedding)
-            
-            logger.info(f"➕ [Generative] Adding to playlist and queue: '{new_track.name}' by {new_track.artist}")
-            
-            self.sp.playlist_add_items(self.playlist_id, [new_track.id])
-            self.playback_queue.append(new_track.id)
-            self.playlist_tracks[new_track.id] = new_track
+            logger.info(f"Successfully replaced Spotify queue with {len(queue_uris)} tracks.")
         
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.error(f"Error processing generative suggestion: {e}")
-            if 'response' in locals() and response:
-                logger.debug(f"Raw LLM response causing error: {response.get('message', {}).get('content', 'N/A')}")
         except Exception as e:
-            logger.error(f"Unexpected error in generative suggestion: {e}", exc_info=True)
-
-    def _add_llm_suggestion_based_on_top_scores(self):
-        if not self.playlist_tracks:
-            return
-            
-        # Get top 10 tracks by score to use as a seed
-        top_tracks = sorted(self.playlist_tracks.values(), key=lambda t: t.score, reverse=True)[:10]
-        prompt = self._build_generative_prompt(top_tracks)
-
-        if not prompt:
-            logger.warning("[LLM Suggestion] Could not build prompt, skipping.")
-            return
-
-        try:
-            response = ollama.chat(model=self.GENERATIVE_MODEL, messages=[{'role': 'user', 'content': prompt}], format="json")
-            content = response['message']['content']
-            recommendation = json.loads(content)
-            
-            song_name, artist_name = recommendation.get('song_name'), recommendation.get('artist_name')
-            if not song_name or not artist_name:
-                logger.warning(f"[LLM Suggestion] LLM response missing keys. Raw: {content}")
-                return
-
-            results = self.sp.search(q=f"track:{song_name} artist:{artist_name}", limit=1, type="track")
-            if not results['tracks']['items']:
-                logger.warning(f"[LLM Suggestion] No Spotify results for '{song_name}' by '{artist_name}'.")
-                return
-
-            track = results['tracks']['items'][0]
-
-            if track['id'] in self.playlist_tracks:
-                logger.info(f"[LLM Suggestion] Skipping '{track['name']}' as it's already in the playlist.")
-                return
-
-            features = self._get_reccobeats_features_batch([track['id']]).get(track['id'])
-            if not features:
-                return
-
-            embedding = self._get_embedding(self._create_embedding_prompt(track, features))
-            new_track = Track(id=track['id'], name=track['name'], artist=track['artists'][0]['name'], embedding=embedding)
-            
-            logger.info(f"➕ [LLM Suggestion] Adding to queue: '{new_track.name}' by {new_track.artist}")
-            
-            self.playback_queue.append(new_track.id)
-            self.playlist_tracks[new_track.id] = new_track
-            
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.error(f"Error processing LLM suggestion: {e}")
-            if 'response' in locals() and response:
-                logger.debug(f"Raw LLM response causing error: {response.get('message', {}).get('content', 'N/A')}")
-        except Exception as e:
-            logger.error(f"Unexpected error in LLM suggestion: {e}", exc_info=True)
-
-
-    def _reorder_queue_after_current(self, current_id):
-        # Group tracks by state: remaining (not jumped/skipped/played), jumped, skipped, full_played
-        remaining, jumped, skipped, played_full = [], [], [], []
-        for tid, track in self.playlist_tracks.items():
-            if tid == current_id:
-                continue
-            # Use skip_count and score heuristic for states
-            if getattr(track, 'played_full', False):
-                played_full.append(tid)
-            elif getattr(track, 'was_jumped', False):
-                jumped.append(tid)
-            elif track.skip_count > 0:
-                skipped.append(tid)
-            else:
-                remaining.append(tid)
-
-        def order_ids(ids):
-            return sorted(ids, key=lambda t: self.playlist_tracks[t].score, reverse=True)
-
-        new_order = order_ids(remaining) + order_ids(jumped) + order_ids(skipped) + order_ids(played_full)
-        self.playback_queue = new_order
-        logger.info(f"Queue reordered after current: {self.playlist_tracks[current_id].name} | {[self.playlist_tracks[tid].name for tid in self.playback_queue]}")
-        # Enqueue next tracks into Spotify player queue
-        self._enqueue_next_tracks()
-
-    def _enqueue_next_tracks(self, limit: int = 20):
-        """Enqueue the next tracks from the internal queue into Spotify's queue.
-        Respect Spotify's hard limit and avoid duplicating items already in the queue.
-        Rate-limit enqueues to avoid 429s.
-        """
-        try:
-            # Determine remaining capacity in Spotify queue (hard limit 81)
-            remaining_capacity = self.SPOTIFY_QUEUE_HARD_LIMIT
-            existing_queue_ids = []
-            try:
-                # Spotipy has `current_user_queue` in newer versions; fall back to `queue` if present
-                get_queue = getattr(self.sp, 'current_user_queue', None) or getattr(self.sp, 'queue', None)
-                if callable(get_queue):
-                    q = get_queue()
-                    queue_items = q.get('queue', []) if isinstance(q, dict) else []
-                    existing_queue_ids = [it.get('id') for it in queue_items if it and it.get('id')]
-                    remaining_capacity = max(0, self.SPOTIFY_QUEUE_HARD_LIMIT - len(existing_queue_ids))
-                    # Also store Spotify's next track id for adjacency detection
-                    try:
-                        currently_playing = q.get('currently_playing') if isinstance(q, dict) else None
-                        next_id = queue_items[0].get('id') if queue_items else None
-                        self._last_spotify_next_id = next_id
-                    except Exception:
-                        pass
-            except Exception:
-                # If we fail to get queue, assume empty to be safe
-                remaining_capacity = self.SPOTIFY_QUEUE_HARD_LIMIT
-
-            if remaining_capacity <= 0:
-                logger.info("Spotify queue is at or above the hard limit; skipping enqueue.")
-                return
-
-            # Filter out tracks already present in Spotify queue to avoid duplicates
-            desired_order = [tid for tid in self.playback_queue if tid not in existing_queue_ids]
-            to_take = min(limit, remaining_capacity, len(desired_order))
-            to_enqueue = desired_order[:to_take]
-            enqueued = 0
-            for tid in to_enqueue:
-                try:
-                    self.sp.add_to_queue(uri=f'spotify:track:{tid}')
-                    enqueued += 1
-                    # Small delay to avoid 429 rate limiting
-                    time.sleep(0.2)
-                except Exception as e:
-                    # Break on 429 storms to retry on next loop
-                    if hasattr(e, 'http_status') and e.http_status == 429:
-                        logger.warning("Hit 429 while enqueuing; will retry later.")
-                        break
-                    logger.warning(f"Failed to enqueue track {tid}: {e}")
-            if enqueued:
-                logger.info(f"Enqueued {enqueued} tracks to Spotify queue.")
-        except Exception as e:
-            logger.warning(f"Failed to enqueue tracks to Spotify queue: {e}")
+            logger.error(f"Failed to replace Spotify queue: {e}", exc_info=True)
