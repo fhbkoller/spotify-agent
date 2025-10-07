@@ -17,7 +17,10 @@ from collections import deque
 
 from persistence import PersistenceManager
 
+# Configure logging to be less verbose for third-party libraries
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("spotipy").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Dataclasses ---
@@ -58,16 +61,17 @@ class Track:
     is_new: bool = False
 
 class IntelligentShuffler:
-    # --- Agent Configuration ---
     EMBEDDING_MODEL = "mxbai-embed-large"
-    GENERATIVE_MODEL = "qwen:7b"
+    GENERATIVE_MODEL = "llama3.1:8b-instruct-q4_k_m"
+    
+    # --- Agent Configuration ---
     API_BATCH_SIZE = 40
     POLLING_INTERVAL_SECONDS = 2
     SPOTIFY_QUEUE_HARD_LIMIT = 81
     RESHUFFLE_THRESHOLD = 5
-    AI_REQUEST_TIMEOUT = 15
-    SKIP_PENALTY = 0.8  # Fallback
-    FINISH_BONUS = 1.1 # Fallback
+    AI_REQUEST_TIMEOUT = 25 # Increased timeout for more complex models
+    SKIP_PENALTY = 0.8
+    FINISH_BONUS = 1.1
 
     def __init__(self, playlist_id: str):
         self._setup_spotify_client()
@@ -92,6 +96,8 @@ class IntelligentShuffler:
 
     def initialize(self):
         logger.info("Initializing Intelligent Shuffle Agent...")
+        logger.info(f"Using embedding model: {self.EMBEDDING_MODEL}")
+        logger.info(f"Using generative model: {self.GENERATIVE_MODEL}")
         logger.info("Syncing tracks from target playlist...")
         
         playlist_items = []
@@ -126,33 +132,33 @@ class IntelligentShuffler:
                 embedding=track_data.get('embedding', np.array([]))
             )
 
-        logger.info(f"Found {len(cache)} tracks in DB. Fetching {len(missing_ids)} new tracks...")
-        
-        missing_track_items = [item for item in all_track_items if item.get('track') and item['track']['id'] in missing_ids]
+        if missing_ids:
+            logger.info(f"Found {len(cache)} tracks in DB. Fetching {len(missing_ids)} new tracks...")
+            missing_track_items = [item for item in all_track_items if item.get('track') and item['track']['id'] in missing_ids]
 
-        for batch in tqdm([missing_track_items[i:i + self.API_BATCH_SIZE] for i in range(0, len(missing_track_items), self.API_BATCH_SIZE)], desc="Analyzing new tracks"):
-            batch_ids = [item['track']['id'] for item in batch]
-            reccobeats_features = self._get_reccobeats_features_batch(batch_ids)
-            
-            if not reccobeats_features:
-                logger.warning(f"Skipping batch due to missing ReccoBeats data.")
-                continue
-
-            for item in batch:
-                track_info = item['track']
-                track_id = track_info['id']
-                track_features = reccobeats_features.get(track_id)
+            for batch in tqdm([missing_track_items[i:i + self.API_BATCH_SIZE] for i in range(0, len(missing_track_items), self.API_BATCH_SIZE)], desc="Analyzing new tracks"):
+                batch_ids = [item['track']['id'] for item in batch]
+                reccobeats_features = self._get_reccobeats_features_batch(batch_ids)
                 
-                if not track_features:
-                    logger.warning(f"No ReccoBeats features for track ID: {track_id}. Skipping embedding.")
+                if not reccobeats_features:
+                    logger.warning(f"Skipping batch due to missing ReccoBeats data.")
                     continue
 
-                embedding_prompt = self._create_embedding_prompt(track_info, track_features)
-                embedding = self._get_embedding(embedding_prompt)
-                
-                new_track = Track(id=track_id, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=embedding)
-                cache[track_id] = new_track
-                self.db.save_track({"id": track_id, "name": new_track.name, "artist": new_track.artist, "embedding": embedding})
+                for item in batch:
+                    track_info = item['track']
+                    track_id = track_info['id']
+                    track_features = reccobeats_features.get(track_id)
+                    
+                    if not track_features:
+                        logger.warning(f"No ReccoBeats features for track: {track_id}, {track_info['name']}, {track_info['artists'][0]['name']}. Skipping embedding.")
+                        continue
+
+                    embedding_prompt = self._create_embedding_prompt(track_info, track_features)
+                    embedding = self._get_embedding(embedding_prompt)
+                    
+                    new_track = Track(id=track_id, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=embedding)
+                    cache[track_id] = new_track
+                    self.db.save_track({"id": track_id, "name": new_track.name, "artist": new_track.artist, "embedding": embedding})
         return cache
 
     def run(self):
@@ -264,16 +270,10 @@ class IntelligentShuffler:
         self._reshuffle_and_update_spotify_queue()
     
     def _apply_similarity_score_updates(self, evaluated_track: Track, score_delta: float):
-        """
-        Adjusts scores of similar tracks based on the evaluated track's performance,
-        with BOTH INFO and DEBUG logging levels correctly implemented.
-        """
         if not evaluated_track.embedding.any():
             return
 
         logger.info(f"Applying similarity scoring based on '{evaluated_track.name}'...")
-        
-        # --- Full Debug Logging Block ---
         logger.debug("--- Start Similarity Scoring Debug ---")
         
         similarities = []
@@ -292,21 +292,18 @@ class IntelligentShuffler:
             logger.debug("--- End Similarity Scoring Debug ---")
             return
 
-        for similar_track, similarity_score in similarities[:10]:
+        for similar_track, similarity_score in similarities[:5]:
             adjustment = score_delta * similarity_score * 0.8
-            
             original_sim_score = similar_track.score
             similar_track.score = max(0.01, similar_track.score + adjustment)
 
-            # --- Personally Requested INFO Log (Restored) ---
             logger.info(f"    -> Similar track '{similar_track.name}' adjustment: {adjustment:+.3f}, new score: {similar_track.score:.2f}")
-
-            # --- Detailed DEBUG Log (Restored) ---
             logger.debug(f"  - Adjusting '{similar_track.name}' based on similarity to '{evaluated_track.name}'.")
             logger.debug(f"    - Cosine Similarity: {similarity_score:.4f}")
             logger.debug(f"    - Score Adj: {adjustment:+.4f}, Score: {original_sim_score:.2f} -> {similar_track.score:.2f}")
 
         logger.debug("--- End Similarity Scoring Debug ---")
+
 
     def _reshuffle_and_update_spotify_queue(self):
         self._reshuffle_internal_queue_only()
@@ -439,7 +436,6 @@ class IntelligentShuffler:
 
     async def _get_ai_score_multiplier_async(self, track: Track, event: str) -> dict | None:
         logger.info(f"Getting AI score multiplier for '{track.name}'...")
-        # --- MORE EFFICIENT PROMPT ---
         history_summary = ", ".join([f"'{evt['track_name']}' was {evt['event']}" for evt in self.session_context.recent_history])
         profile_summary = ", ".join([f"{k.replace('average_', '')}:{v}" for k,v in self.session_context.get_sonic_profile().items()])
 
