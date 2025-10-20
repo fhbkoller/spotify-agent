@@ -158,7 +158,12 @@ class IntelligentShuffler:
                     
                     new_track = Track(id=track_id, name=track_info['name'], artist=track_info['artists'][0]['name'], embedding=embedding)
                     cache[track_id] = new_track
-                    self.db.save_track({"id": track_id, "name": new_track.name, "artist": new_track.artist, "embedding": embedding})
+                    
+                    # *** MODIFIED LINE: Pass the embedding_prompt to save_track ***
+                    self.db.save_track(
+                        {"id": track_id, "name": new_track.name, "artist": new_track.artist, "embedding": embedding},
+                        embedding_prompt=embedding_prompt
+                    )
         return cache
 
     def run(self):

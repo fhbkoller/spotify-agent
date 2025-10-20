@@ -41,3 +41,6 @@ chroma_db/
 .vscode/
 *.swp
 *.swo
+
+## Other
+*.ipynb
