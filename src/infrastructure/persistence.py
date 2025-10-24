@@ -16,8 +16,8 @@ from sqlalchemy import (
 
 logger = logging.getLogger(__name__)
 
-DB_FILE = "spotify_agent.db"
-CHROMA_PATH = "chroma_db"
+DB_FILE = "data/spotify_agent.db"
+CHROMA_PATH = "data/chroma_db"
 EMBEDDING_COLLECTION_NAME = "song_embeddings"
 
 metadata = MetaData()

@@ -60,8 +60,8 @@ Spotify Agent is an AI-driven playlist manager and intelligent shuffler for Spot
 
 ## Database Schema
 
-- **SQLite (`spotify_agent.db`)**: Stores track ID, name, artist
-- **ChromaDB (`chroma_db/`)**: Stores vector embeddings for each track
+- **SQLite (`data/spotify_agent.db`)**: Stores track ID, name, artist
+- **ChromaDB (`data/chroma_db/`)**: Stores vector embeddings for each track
 
 ---
 
@@ -83,6 +83,6 @@ Spotify Agent is an AI-driven playlist manager and intelligent shuffler for Spot
 
 ## Troubleshooting
 
-- Check `spotify_agent.log` for detailed logs
+- Check `data/spotify_agent.log` for detailed logs
 - Ensure Spotify API credentials are set in `.env`
 - Make sure Ollama is running and models are available

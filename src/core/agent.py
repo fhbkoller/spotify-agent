@@ -15,7 +15,7 @@ from threading import Thread, Event
 from queue import Queue, Empty
 from collections import deque
 
-from persistence import PersistenceManager
+from ..infrastructure.persistence import PersistenceManager
 
 # Configure logging to be less verbose for third-party libraries
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

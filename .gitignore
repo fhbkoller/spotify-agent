@@ -44,3 +44,7 @@ chroma_db/
 
 ## Other
 *.ipynb
+*.csv
+
+## Models
+models/

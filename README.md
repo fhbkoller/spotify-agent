@@ -8,7 +8,7 @@ Spotify Agent is an AI-powered playlist manager and intelligent shuffler for Spo
 - **AI Recommendations:** Adds new songs using both similarity search (vector embeddings) and generative AI suggestions (via Ollama).
 - **Persistent Memory:** Remembers track stats and embeddings using SQLite and ChromaDB.
 - **Full Liked Songs Import:** Easily create a playlist from all your liked songs.
-- **Robust Logging:** Detailed logs for debugging and monitoring (saved to `spotify_agent.log`).
+- **Robust Logging:** Detailed logs for debugging and monitoring (saved to `data/spotify_agent.log`).
 
 ## Setup
 
@@ -71,16 +71,23 @@ The agent will:
 
 ### Logs
 
-All logs are saved to `spotify_agent.log`.
+All logs are saved to `data/spotify_agent.log`.
 
 ## Project Structure
 
-- `main.py` — Entry point for the intelligent shuffler
-- `create_playlist.py` — Script to create a playlist from all liked songs
-- `spotify_agent.py` — Core logic for the agent and shuffling
-- `persistence.py` — Database and embedding management
-- `chroma_db/` — ChromaDB vector store
-- `spotify_agent.db` — SQLite database for track stats
+The project follows clean architecture principles with clear separation of concerns:
+
+- `src/core/` — Core application logic (agent, models, main entry point)
+- `src/infrastructure/` — Database and external service management
+- `src/services/` — Business logic services (ready for future expansion)
+- `src/utils/` — Utilities and logging configuration
+- `ml/` — Machine learning components (training, testing, data processing)
+- `scripts/` — Utility scripts for specific tasks
+- `data/` — All data storage (models, databases, logs, training data)
+- `main.py` — Main application entry point
+- `create_playlist.py` — Playlist creation script
+
+For detailed architecture information, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## License
 
