@@ -14,3 +14,6 @@ pandas
 python-dotenv
 scikit-learn
 scipy
+librosa
+orjson
+datasets
