@@ -1,3 +1,5 @@
+# ml/data_pipeline/specificity_generator_v4.py
+
 import pandas as pd
 import numpy as np
 import random
@@ -6,12 +8,13 @@ import os
 import sys
 import re # For parsing table values
 
-# Add src to path to import logging
+# Add project root to path to import logging
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from src.utils.logging import logger
 
-# --- Configuration ---
-OUTPUT_FILE = 'ml/data/synthetic_specificity_v2.csv' # Outputting V2 data
+# --- V4.0 Configuration ---
+OUTPUT_FILE = 'ml/data/synthetic_specificity_v4.parquet' # V4 Parquet output
+logger.info(f"V4.0 Specificity Generator. Output will be saved to {OUTPUT_FILE}")
 
 # --- Scale ---
 NUM_TRIPLETS_PER_FEATURE_CASE = 9000
@@ -24,7 +27,7 @@ NUMERICAL_FEATURES = [
     'acousticness', 'danceability', 'energy', 'instrumentalness',
     'liveness', 'speechiness', 'valence', 'tempo', 'loudness'
 ]
-FEATURE_COLUMNS = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
+FEATURE_COLUMNS = NUMERICAL_FEATURES + CATEGORICAL_FEATURES # 11 features total
 
 # --- Consistent Genre Label Mapping (Matches fma_processor) ---
 # Based on the 15 TOP_LEVEL_GENRES used in fma_processor for consistency
@@ -35,11 +38,14 @@ TOP_LEVEL_GENRES_NAMES = [
     'Blues', 'Soul-RnB', 'Easy Listening'
 ]
 GENRE_TO_LABEL_ID = {name: i for i, name in enumerate(TOP_LEVEL_GENRES_NAMES)}
-# Use 'Rock' as the default if a specific genre isn't found in the map
-DEFAULT_GENRE_ID = GENRE_TO_LABEL_ID.get('Rock', 7) # Default to Rock's ID
+# *** V4.0 NEW (Task 1.C) ***
+LABEL_ID_TO_GENRE = {i: name for name, i in GENRE_TO_LABEL_ID.items()}
+DEFAULT_GENRE_NAME = 'Rock'
+DEFAULT_GENRE_ID = GENRE_TO_LABEL_ID.get(DEFAULT_GENRE_NAME, 7) 
 
 # --- Helper Functions (Normalization, Parsing) ---
 def parse_mu_sigma(val_str):
+    """Parses (mean, std_dev) strings from the research doc tables."""
     if pd.isna(val_str) or not isinstance(val_str, str):
         return (0.5, 0.1)
     match = re.match(r'\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)', val_str)
@@ -54,22 +60,20 @@ def parse_mu_sigma(val_str):
             return (0.5, 0.1)
 
 def normalize_loudness(mu_db, sigma_db):
-    # Normalize dB using the range observed in typical music data (approx -60dB to 0dB)
-    # Clip to avoid extreme values from affecting normalization too much
+    """Normalizes loudness from dB to 0-1 range."""
     mu_norm = np.clip((mu_db + 60) / 60, 0.0, 1.0)
-    # Normalize std dev relative to the range
-    sigma_norm = np.clip(sigma_db / 60, 0.0, 0.5) # Limit max normalized std dev
+    sigma_norm = np.clip(sigma_db / 60, 0.0, 0.5) 
     return (mu_norm, sigma_norm)
 
 def normalize_tempo(mu_bpm, sigma_bpm):
-    # Normalize BPM using a reasonable range (e.g., 0-250 BPM)
+    """Normalizes tempo from BPM to 0-1 range."""
     mu_norm = np.clip(mu_bpm / 250.0, 0.0, 1.0)
-    sigma_norm = np.clip(sigma_bpm / 250.0, 0.0, 0.5) # Limit max normalized std dev
+    sigma_norm = np.clip(sigma_bpm / 250.0, 0.0, 0.5)
     return (mu_norm, sigma_norm)
 
 
 # --- Vibe Profile Definitions (Directly from Research Doc Table 2) ---
-#
+# (Using normalized values)
 VIBE_PROFILES = {
     'Positive': {
         'Joyful / Happy': {'danceability': (0.68, 0.15), 'energy': (0.70, 0.18), 'loudness': normalize_loudness(-6.5, 3.5), 'speechiness': (0.07, 0.06), 'acousticness': (0.22, 0.25), 'instrumentalness': (0.02, 0.08), 'liveness': (0.18, 0.14), 'valence': (0.75, 0.15), 'tempo': normalize_tempo(125.0, 26.0), 'key': (5.3, 3.5), 'mode': (0.8, 0.4)},
@@ -93,8 +97,6 @@ VIBE_PROFILES = {
         'Scary / Anxious': {'danceability': (0.40, 0.22), 'energy': (0.75, 0.20), 'loudness': normalize_loudness(-9.0, 4.8), 'speechiness': (0.08, 0.07), 'acousticness': (0.30, 0.30), 'instrumentalness': (0.70, 0.28), 'liveness': (0.20, 0.17), 'valence': (0.10, 0.10), 'tempo': normalize_tempo(140.0, 40.0), 'key': (4.5, 3.8), 'mode': (0.3, 0.5)},
     }
 }
-# Define semantic relationships for vibe triplets (Based on research doc logic)
-# (Anchor Vibe): [(Hard Negative Vibe), (Easy Negative Vibe)]
 VIBE_RELATIONSHIPS = {
     ('Positive', 'Joyful / Happy'): [('Positive', 'Cheerful'), ('Reflective', 'Sad')],
     ('Positive', 'Cheerful'): [('Positive', 'Joyful / Happy'), ('Reflective', 'Melancholic')],
@@ -148,7 +150,6 @@ GENRE_PROFILES = {
     'Folk': {
         'Overall': {'danceability': (0.5, 0.15), 'energy': (0.4, 0.2), 'loudness': normalize_loudness(-10.0, 5.0), 'speechiness': (0.05, 0.03), 'acousticness': (0.75, 0.2), 'instrumentalness': (0.1, 0.2), 'liveness': (0.15, 0.1), 'valence': (0.5, 0.2), 'tempo': normalize_tempo(110.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
     },
-    # Add other top-level genres needed for relationships, using reasonable defaults if stats are missing
     'Blues': {
         'Overall': {'danceability': (0.6, 0.15), 'energy': (0.5, 0.2), 'loudness': normalize_loudness(-9.5, 4.0), 'speechiness': (0.07, 0.05), 'acousticness': (0.5, 0.2), 'instrumentalness': (0.2, 0.2), 'liveness': (0.2, 0.1), 'valence': (0.6, 0.2), 'tempo': normalize_tempo(118.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.7, 0.4)},
      },
@@ -161,12 +162,19 @@ GENRE_PROFILES = {
      'Instrumental': {
         'Overall': {'danceability': (0.4, 0.15), 'energy': (0.3, 0.2), 'loudness': normalize_loudness(-16.0, 6.0), 'speechiness': (0.04, 0.02), 'acousticness': (0.8, 0.15), 'instrumentalness': (0.85, 0.15), 'liveness': (0.15, 0.1), 'valence': (0.3, 0.2), 'tempo': normalize_tempo(105.0, 30.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
     },
-    'Old-Time / Historic': { # Added based on adjacency map
+    'Old-Time / Historic': {
+        'Overall': {'danceability': (0.5, 0.15), 'energy': (0.3, 0.2), 'loudness': normalize_loudness(-12.0, 5.0), 'speechiness': (0.06, 0.04), 'acousticness': (0.85, 0.15), 'instrumentalness': (0.2, 0.2), 'liveness': (0.18, 0.1), 'valence': (0.5, 0.2), 'tempo': normalize_tempo(100.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
+    },
+    'Easy Listening': { # Added based on adjacency map
+        'Overall': {'danceability': (0.5, 0.15), 'energy': (0.3, 0.2), 'loudness': normalize_loudness(-12.0, 5.0), 'speechiness': (0.06, 0.04), 'acousticness': (0.85, 0.15), 'instrumentalness': (0.2, 0.2), 'liveness': (0.18, 0.1), 'valence': (0.5, 0.2), 'tempo': normalize_tempo(100.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
+    },
+    'Spoken': { # Added based on adjacency map
+        'Overall': {'danceability': (0.5, 0.15), 'energy': (0.3, 0.2), 'loudness': normalize_loudness(-12.0, 5.0), 'speechiness': (0.06, 0.04), 'acousticness': (0.85, 0.15), 'instrumentalness': (0.2, 0.2), 'liveness': (0.18, 0.1), 'valence': (0.5, 0.2), 'tempo': normalize_tempo(100.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
+    },
+    'International': { # Added based on adjacency map
         'Overall': {'danceability': (0.5, 0.15), 'energy': (0.3, 0.2), 'loudness': normalize_loudness(-12.0, 5.0), 'speechiness': (0.06, 0.04), 'acousticness': (0.85, 0.15), 'instrumentalness': (0.2, 0.2), 'liveness': (0.18, 0.1), 'valence': (0.5, 0.2), 'tempo': normalize_tempo(100.0, 25.0), 'key': (5.0, 3.5), 'mode': (0.8, 0.4)},
     },
 }
-# Relationships for genres (Based on research doc logic)
-# (Anchor Genre, Anchor SubGenre): [(Hard Negative Genre, SubGenre), (Easy Negative Genre, SubGenre)]
 GENRE_RELATIONSHIPS = {
     ('Rock', 'Classic Rock'): [('Rock', 'Hard Rock'), ('Pop', 'Dance Pop')],
     ('Rock', 'Hard Rock'): [('Rock', 'Punk'), ('Electronic', 'Ambient')],
@@ -180,40 +188,48 @@ GENRE_RELATIONSHIPS = {
     ('Electronic', 'House'): [('Pop', 'Dance Pop'), ('Folk', 'Overall')],
     ('Electronic', 'Techno'): [('Electronic', 'House'), ('Jazz', 'Overall')],
     ('Electronic', 'Ambient'): [('Classical', 'Overall'), ('Rock', 'Punk')],
-    # Adding 'Overall' relationships based on adjacency map in research doc
-    ('Rock', 'Overall'): [('Pop', 'Overall'), ('Folk', 'Overall')], # Example: Rock -> adjacent Pop (hard), distant Folk (easy)
+    ('Rock', 'Overall'): [('Pop', 'Overall'), ('Folk', 'Overall')], 
     ('Pop', 'Overall'): [('Rock', 'Overall'), ('Soul-RnB', 'Overall')],
     ('Hip-Hop', 'Overall'): [('Electronic', 'Overall'), ('Jazz', 'Overall')],
     ('Electronic', 'Overall'): [('Pop', 'Overall'), ('Experimental', 'Overall')],
     ('Jazz', 'Overall'): [('Hip-Hop', 'Overall'), ('Blues', 'Overall')],
     ('Classical', 'Overall'): [('Jazz', 'Overall'), ('Instrumental', 'Overall')],
     ('Folk', 'Overall'): [('Rock', 'Overall'), ('Old-Time / Historic', 'Overall')],
-    # Add fallbacks for any other genres needed
     ('Blues', 'Overall'): [('Rock', 'Overall'), ('Jazz', 'Overall')],
     ('Soul-RnB', 'Overall'): [('Pop', 'Overall'), ('Hip-Hop', 'Overall')],
     ('Experimental', 'Overall'): [('Electronic', 'Overall'), ('Instrumental', 'Overall')],
     ('Instrumental', 'Overall'): [('Classical', 'Overall'), ('Jazz', 'Overall')],
     ('Old-Time / Historic', 'Overall'): [('Folk', 'Overall'), ('Blues', 'Overall')],
+    ('Easy Listening', 'Overall'): [('Pop', 'Overall'), ('Jazz', 'Overall')],
+    ('Spoken', 'Overall'): [('Experimental', 'Overall'), ('Hip-Hop', 'Overall')],
+    ('International', 'Overall'): [('Pop', 'Overall'), ('Folk', 'Overall')],
 }
 
 
 class SpecificityGenerator:
+    """
+    Generates a V4.0 synthetic dataset of triplets as dictionaries.
+    """
     def __init__(self, output_path, logger):
         self.output_path = output_path
         self.logger = logger
-        self.final_triplets = []
+        self.final_triplets = [] # Will store tuples of (anchor_dict, pos_dict, neg_dict)
 
-    # _generate_sample_from_profile, _create_base_sample, _perturb_sample are unchanged
     def _generate_sample_from_profile(self, profile_dict, profile_key):
-        """Generates a single 11-feature sample from a potentially nested profile."""
+        """
+        Generates a single 11-feature sample dict from a (Category, SubCategory) key.
+        """
         if isinstance(profile_key, tuple) and len(profile_key) == 2:
             key1, key2 = profile_key
             if key1 in profile_dict and key2 in profile_dict[key1]:
                 profile = profile_dict[key1][key2]
             else:
-                 return self._create_base_sample() # Fallback
+                 # Fallback to parent 'Overall' if sub-key is missing
+                 profile = profile_dict.get(key1, {}).get('Overall', {})
+                 if not profile:
+                    return self._create_base_sample() # Absolute fallback
         else:
-            return self._create_base_sample() # Fallback
+            return self._create_base_sample() # Fallback for bad key
 
         sample = {}
         for feature in NUMERICAL_FEATURES:
@@ -256,23 +272,28 @@ class SpecificityGenerator:
             perturbed[feature] = np.clip(val, 0.0, 1.0)
         return perturbed
 
-    # *** CHANGED: Modified to accept and return genre_label ***
-    def _format_triplet(self, anchor, positive, negative, genre_label):
-        """Flattens a triplet into the CSV row format."""
-        all_features = {f'anchor_{f}': anchor[f] for f in FEATURE_COLUMNS}
-        all_features.update({f'positive_{f}': positive[f] for f in FEATURE_COLUMNS})
-        all_features.update({f'negative_{f}': negative[f] for f in FEATURE_COLUMNS})
-        # *** NEW: Add the genre label to the dictionary ***
-        all_features['anchor_genre_label'] = genre_label
-        return all_features
+    # *** V4.0 MODIFIED (Task 1.C) ***
+    def _format_triplet(self, anchor, positive, negative, genre_label_id):
+        """
+        Formats the triplet. For V4, this means adding the 'genre' string
+        to the anchor dictionary.
+        """
+        # Look up the string name from the ID
+        genre_name = LABEL_ID_TO_GENRE.get(genre_label_id, DEFAULT_GENRE_NAME)
+        
+        # Add the genre string to the anchor dict.
+        # Positive and negative dicts do not get a genre string.
+        # This is intentional and will help train the model for partial inputs.
+        anchor['genre'] = genre_name 
+        
+        return (anchor, positive, negative)
 
-    # generate_single_feature_triplets is updated to pass the default genre label
     def generate_single_feature_triplets(self, num_per_case):
         self.logger.info(f"Generating single-feature hard cases ({num_per_case} each)...")
         start_count = len(self.final_triplets)
 
-        # *** NEW: Assign a default genre for these non-genre-specific tests ***
-        default_genre_label = GENRE_TO_LABEL_ID.get('Rock', DEFAULT_GENRE_ID)
+        # Assign a default genre ID for these non-genre-specific tests
+        default_genre_label = DEFAULT_GENRE_ID
 
         self.logger.info("... generating for 'mode' (Major vs Minor)")
         for _ in range(num_per_case):
@@ -291,13 +312,15 @@ class SpecificityGenerator:
             anchor = self._perturb_sample(base, 0.01)
             positive = self._perturb_sample(base, 0.01)
 
-            negative_easy = anchor.copy()
-            negative_easy['key'] = (anchor['key'] + 6) % 12
-            self.final_triplets.append(self._format_triplet(anchor, positive, negative_easy, default_genre_label))
-
+            # Hard Negative (Adjacent Key)
             negative_hard = anchor.copy()
             negative_hard['key'] = (anchor['key'] + 1) % 12
             self.final_triplets.append(self._format_triplet(anchor, positive, negative_hard, default_genre_label))
+            
+            # Easy Negative (Distant Key - Tritone)
+            negative_easy = anchor.copy()
+            negative_easy['key'] = (anchor['key'] + 6) % 12
+            self.final_triplets.append(self._format_triplet(anchor, positive, negative_easy, default_genre_label))
 
         for feature in NUMERICAL_FEATURES:
             self.logger.info(f"... generating for '{feature}'")
@@ -310,19 +333,20 @@ class SpecificityGenerator:
                 anchor[feature] = base_val
 
                 positive = self._perturb_sample(base, 0.005)
-                positive[feature] = np.clip(base_val + 0.01, 0.0, 1.0)
+                positive[feature] = np.clip(base_val + 0.01, 0.0, 1.0) # Very close
 
+                # Hard Negative (a bit further)
                 negative_hard = self._perturb_sample(base, 0.005)
                 negative_hard[feature] = np.clip(base_val + 0.1, 0.0, 1.0)
                 self.final_triplets.append(self._format_triplet(anchor, positive, negative_hard, default_genre_label))
 
+                # Easy Negative (very far)
                 negative_easy = self._perturb_sample(base, 0.005)
                 negative_easy[feature] = np.clip(base_val + 0.5, 0.0, 1.0)
                 self.final_triplets.append(self._format_triplet(anchor, positive, negative_easy, default_genre_label))
 
         self.logger.info(f"Generated {len(self.final_triplets) - start_count} single-feature triplets.")
 
-    # _generate_profile_triplets is updated to pass the correct genre label
     def _generate_profile_triplets(self, num_total, profile_dict, relationship_dict, profile_type):
         self.logger.info(f"Generating {num_total} {profile_type} profile triplets...")
         start_count = len(self.final_triplets)
@@ -330,12 +354,10 @@ class SpecificityGenerator:
         all_profile_keys = []
         if profile_type == 'genre':
             for genre, subgenres in profile_dict.items():
-                for subgenre in subgenres:
-                     # Ensure the parent genre is one we have a label for
-                     if genre in GENRE_TO_LABEL_ID:
-                        all_profile_keys.append((genre, subgenre))
-                     # else: logger.debug(f"Skipping profile key ({genre}, {subgenre}) - Parent genre not in TOP_LEVEL_GENRES_NAMES")
-
+                # Only use genres that are in our V4 genre map
+                if genre in GENRE_TO_LABEL_ID:
+                    for subgenre in subgenres:
+                         all_profile_keys.append((genre, subgenre))
         elif profile_type == 'vibe':
              for category, feelings in profile_dict.items():
                 for feeling in feelings:
@@ -354,45 +376,36 @@ class SpecificityGenerator:
         while generated_count < num_total:
             anchor_key = random.choice(all_profile_keys)
 
-            # *** NEW: Get the genre label ID for this anchor ***
-            # Use the actual genre name for genre profiles, fallback to 'Rock' for vibe profiles
-            anchor_genre_name = anchor_key[0] if profile_type == 'genre' else 'Rock'
-            anchor_genre_label = GENRE_TO_LABEL_ID.get(anchor_genre_name, DEFAULT_GENRE_ID)
+            # --- V4.0: Get the genre label ID for this anchor ---
+            # Use the actual genre name for genre profiles
+            # Fallback to 'Rock' for vibe profiles
+            anchor_genre_name = anchor_key[0] if profile_type == 'genre' else DEFAULT_GENRE_NAME
+            anchor_genre_label_id = GENRE_TO_LABEL_ID.get(anchor_genre_name, DEFAULT_GENRE_ID)
 
             # Find relationships
-            if anchor_key not in relationship_dict:
-                missing_relationships += 1
-                # Fallback logic: Use parent genre relationship if subgenre missing, or random if parent missing
-                if profile_type == 'genre':
-                    parent_key = (anchor_key[0], 'Overall')
-                    if parent_key in relationship_dict:
-                        hard_neg_key, easy_neg_key = relationship_dict[parent_key]
-                    else: # Parent relationship also missing, choose random different genre
-                        possible_negs = [k for k in all_profile_keys if k[0] != anchor_key[0] and profile_type == 'genre']
-                        if not possible_negs: continue # Skip if no valid negatives
-                        hard_neg_key = random.choice(possible_negs)
-                        easy_neg_key = random.choice(possible_negs)
-                else: # Fallback for vibes (choose random different category)
-                     possible_negs = [k for k in all_profile_keys if k[0] != anchor_key[0] and profile_type == 'vibe']
-                     if not possible_negs: continue
-                     hard_neg_key = random.choice(possible_negs)
-                     easy_neg_key = random.choice(possible_negs)
-            else:
-                 hard_neg_key, easy_neg_key = relationship_dict[anchor_key]
+            relationship = relationship_dict.get(anchor_key)
+            if not relationship:
+                # Fallback to parent 'Overall' relationship if subgenre is missing
+                parent_key = (anchor_key[0], 'Overall')
+                relationship = relationship_dict.get(parent_key)
+                if not relationship:
+                    missing_relationships += 1
+                    continue # Skip if no relationship found
+            
+            hard_neg_key, easy_neg_key = relationship
 
-            # Generate samples
+            # Generate samples (as dicts)
             anchor = self._generate_sample_from_profile(profile_dict, anchor_key)
 
             # Select positive (allow sibling positive for genres)
             positive_key = anchor_key
             if profile_type == 'genre' and anchor_key[1] != 'Overall': # Only for subgenres
                 parent_genre = anchor_key[0]
-                # Find siblings (other subgenres under the same parent)
                 siblings = [sg for sg in profile_dict.get(parent_genre, {}) if sg != anchor_key[1] and sg != 'Overall']
-                # 30% chance to use a sibling as positive
-                if random.random() < 0.3 and siblings:
+                if random.random() < 0.3 and siblings: # 30% chance to use a sibling as positive
                     sibling_subgenre = random.choice(siblings)
                     positive_key = (parent_genre, sibling_subgenre)
+            
             positive = self._generate_sample_from_profile(profile_dict, positive_key)
 
             # Select negative (70% hard, 30% easy)
@@ -401,56 +414,38 @@ class SpecificityGenerator:
             else:
                 negative = self._generate_sample_from_profile(profile_dict, easy_neg_key)
 
-            # *** CHANGED: Pass the real genre label ***
-            self.final_triplets.append(self._format_triplet(anchor, positive, negative, anchor_genre_label))
+            # --- V4.0 MODIFIED (Task 1.C) ---
+            # Pass the dicts and the genre_label_id to the formatter
+            self.final_triplets.append(
+                self._format_triplet(anchor, positive, negative, anchor_genre_label_id)
+            )
             generated_count += 1
             pbar.update(1)
+            
         pbar.close()
 
         if missing_relationships > 0:
-            self.logger.warning(f"Used fallback relationships for {missing_relationships} out of {num_total} {profile_type} triplets.")
+            self.logger.warning(f"Skipped {missing_relationships} triplets due to missing relationships.")
         self.logger.info(f"Generated {generated_count} {profile_type} triplets.")
 
-
-    # save_to_csv is updated to handle the new genre_label column and ensure order
-    def save_to_csv(self):
-        self.logger.info(f"Saving {len(self.final_triplets)} total triplets to {self.output_path}...")
+    # *** V4.0 MODIFIED (Task 1.C) ***
+    def save_to_parquet(self):
+        """Saves the final list of triplets to a Parquet file."""
+        self.logger.info(f"Saving {len(self.final_triplets)} total V4 triplets to {self.output_path}...")
 
         if not self.final_triplets:
             self.logger.error("No triplets were generated. Stopping.")
             return
 
-        output_df = pd.DataFrame(self.final_triplets)
+        # self.final_triplets is a list of (anchor_dict, pos_dict, neg_dict)
+        output_df = pd.DataFrame(self.final_triplets, columns=['anchor', 'positive', 'negative'])
 
-        # Rename descriptive feature names to indexed names ('feat_0', 'feat_1', ...)
-        rename_map = {}
-        for i, feature_name in enumerate(FEATURE_COLUMNS):
-            rename_map[f'anchor_{feature_name}'] = f'anchor_feat_{i}'
-            rename_map[f'positive_{feature_name}'] = f'positive_feat_{i}'
-            rename_map[f'negative_{feature_name}'] = f'negative_feat_{i}'
+        # Shuffle
+        output_df = output_df.sample(frac=1).reset_index(drop=True)
 
-        output_df.rename(columns=rename_map, inplace=True)
-
-        # *** NEW: Define final column order, starting with genre label ***
-        # (anchor_genre_label, anchor_feat_0...10, positive_feat_0...10, negative_feat_0...10)
-        final_ordered_cols = ['anchor_genre_label']
-        for prefix in ['anchor', 'positive', 'negative']:
-            for i in range(len(FEATURE_COLUMNS)):
-                final_ordered_cols.append(f'{prefix}_feat_{i}')
-
-        # Ensure all expected columns exist, add if missing (with default value)
-        for col in final_ordered_cols:
-            if col not in output_df:
-                logger.warning(f"Column {col} missing from generated data. Adding with default.")
-                # Use -1 for missing label, 0.0 for missing features
-                default_value = -1 if col == 'anchor_genre_label' else 0.0
-                output_df[col] = default_value
-
-        # Reorder DataFrame columns
-        output_df = output_df[final_ordered_cols]
-
-        output_df.to_csv(self.output_path, index=False)
-        self.logger.info("Done.")
+        # Save to Parquet
+        output_df.to_parquet(self.output_path, index=False)
+        self.logger.info(f"V4.0 Synthetic dataset saved successfully to {self.output_path}")
 
 # --- Main Execution ---
 def main():
@@ -460,16 +455,19 @@ def main():
         output_path=OUTPUT_FILE,
         logger=logger
     )
-
+    
+    # 1. Generate single-feature cases
     generator.generate_single_feature_triplets(num_per_case=NUM_TRIPLETS_PER_FEATURE_CASE)
-
+    
+    # 2. Generate vibe-based cases
     generator._generate_profile_triplets(
         num_total=NUM_TRIPLETS_FOR_VIBES,
         profile_dict=VIBE_PROFILES,
         relationship_dict=VIBE_RELATIONSHIPS,
         profile_type="vibe"
     )
-
+    
+    # 3. Generate genre-based cases
     generator._generate_profile_triplets(
         num_total=NUM_TRIPLETS_FOR_GENRES,
         profile_dict=GENRE_PROFILES,
@@ -477,7 +475,8 @@ def main():
         profile_type="genre"
     )
 
-    generator.save_to_csv()
+    # 4. Save the final file
+    generator.save_to_parquet()
 
 if __name__ == "__main__":
     main()
