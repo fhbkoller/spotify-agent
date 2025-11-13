@@ -8,3 +8,12 @@ requests
 SQLAlchemy
 chromadb
 aiohttp
+sentence-transformers
+torch
+pandas
+python-dotenv
+scikit-learn
+scipy
+librosa
+orjson
+datasets

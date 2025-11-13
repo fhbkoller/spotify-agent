@@ -16,15 +16,12 @@ from sqlalchemy import (
 
 logger = logging.getLogger(__name__)
 
-DB_FILE = "spotify_agent.db"
-CHROMA_PATH = "chroma_db"
+DB_FILE = "data/spotify_agent.db"
+CHROMA_PATH = "data/chroma_db"
 EMBEDDING_COLLECTION_NAME = "song_embeddings"
 
 metadata = MetaData()
 
-### --- MENTORSHIP NOTE: REMOVED SCORE-RELATED COLUMNS --- ###
-# We no longer persist scores, so these columns are not needed in the main table definition
-# for new tables. The code will still work with old tables, it just won't use the columns.
 songs_table = Table(
     "songs",
     metadata,
@@ -77,7 +74,7 @@ class PersistenceManager:
         logger.debug(f"DB lookup: Found {len(found_tracks)} tracks, missing {len(missing_ids)} tracks.")
         return found_tracks, missing_ids
 
-    def save_track(self, track_data: dict):
+    def save_track(self, track_data: dict, embedding_prompt: str = ""):
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
         stmt = sqlite_insert(songs_table).values(
             id=track_data["id"],
@@ -90,14 +87,25 @@ class PersistenceManager:
             conn.commit()
 
         if 'embedding' in track_data and track_data['embedding'] is not None:
-            self.save_embedding(track_data["id"], track_data["embedding"])
+            metadata = {
+                "name": track_data["name"],
+                "artist": track_data["artist"]
+            }
+            self.save_embedding(
+                track_id=track_data["id"],
+                embedding=track_data["embedding"],
+                document=embedding_prompt,
+                metadata=metadata
+            )
         logger.debug(f"Saved track '{track_data['name']}' to persistence.")
 
-    def save_embedding(self, track_id: str, embedding: np.ndarray):
+    def save_embedding(self, track_id: str, embedding: np.ndarray, document: str, metadata: dict):
         try:
             self.embedding_collection.upsert(
                 ids=[track_id],
                 embeddings=[embedding.tolist()],
+                documents=[document],
+                metadatas=[metadata],
             )
         except Exception as e:
                 logger.error(f"Failed to write embedding for {track_id}: {e}")

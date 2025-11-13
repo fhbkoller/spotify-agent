@@ -1,5 +1,6 @@
 # Python virtual environment
 venv/
+.venv
 __pycache__/
 
 # Environment variables
@@ -41,3 +42,15 @@ chroma_db/
 .vscode/
 *.swp
 *.swo
+
+## Other
+*.ipynb
+*.csv
+*.mp3
+
+# Models
+models/
+
+# Misc data
+ml/data/*
+*.tar
